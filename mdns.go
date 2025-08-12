@@ -24,7 +24,7 @@ var (
 		Port: 5353,
 	}
 
-	// AddrIPv6LinkLocalMulticast is the IPv5 link-local multicast UDP address.
+	// AddrIPv6LinkLocalMulticast is the IPv6 link-local multicast UDP address.
 	AddrIPv6LinkLocalMulticast = &net.UDPAddr{
 		IP:   IPv6LinkLocalMulticast,
 		Port: 5353,
@@ -35,6 +35,9 @@ var (
 
 	// TTLHostname is the default time-to-livefor mDNS hostname records.
 	TTLHostname uint32 = 120
+
+	// Enable IPv6 link-local multicast (default: true)
+	EnableIPv6LinkLocalMulticast = true
 )
 
 // Query is a mDNS query
@@ -161,17 +164,32 @@ func (c *mdnsConn) Drain(ctx context.Context) {
 	}
 }
 
+// JoinGroup joins the multicast group for the specified interface.
+func (c *mdnsConn) JoinGroup(iface *net.Interface) error {
+	if c.ipv4 != nil {
+		return c.ipv4.JoinGroup(iface, &net.UDPAddr{IP: IPv4LinkLocalMulticast})
+	}
+
+	if c.ipv6 != nil {
+		return c.ipv6.JoinGroup(iface, &net.UDPAddr{IP: IPv6LinkLocalMulticast})
+	}
+
+	return fmt.Errorf("no suitable connection for %s", iface.Name)
+}
+
 // Close closes the mDNS connection.
 func (c *mdnsConn) Close() {
 	c.close()
 }
 
 func newMDNSConn(ifs ...string) (*mdnsConn, error) {
+	var err error
 	var errs []error
 	var connIPv4 *ipv4.PacketConn
 	var connIPv6 *ipv6.PacketConn
+	var conn4, conn6 *net.UDPConn
 
-	conn4, err := net.ListenUDP("udp4", AddrIPv4LinkLocalMulticast)
+	conn4, err = net.ListenUDP("udp4", AddrIPv4LinkLocalMulticast)
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -200,30 +218,32 @@ func newMDNSConn(ifs ...string) (*mdnsConn, error) {
 		}
 	}
 
-	conn6, err := net.ListenUDP("udp6", AddrIPv6LinkLocalMulticast)
-	if err != nil {
-		errs = append(errs, err)
-	}
-	connIPv6 = ipv6.NewPacketConn(conn6)
-	if err := connIPv6.SetControlMessage(ipv6.FlagInterface, true); err != nil {
-		log.Debug.Printf("IPv6 interface socket opt: %v", err)
-	}
-	// Enable multicast loopback to receive all sent data
-	if err := connIPv6.SetMulticastLoopback(true); err != nil {
-		log.Debug.Println("IPv6 set multicast loopback:", err)
-	}
-	// Set TTL to 255 (rfc6762)
-	if err := connIPv6.SetHopLimit(255); err != nil {
-		log.Debug.Println("IPv4 set TTL:", err)
-	}
-	if err := connIPv6.SetMulticastHopLimit(255); err != nil {
-		log.Debug.Println("IPv4 set multicast TTL:", err)
-	}
-	for _, iface := range MulticastInterfaces(ifs...) {
-		if err := connIPv6.JoinGroup(iface, &net.UDPAddr{IP: IPv6LinkLocalMulticast}); err != nil {
-			log.Debug.Printf("Failed joining IPv6 %v: %v", iface.Name, err)
-		} else {
-			log.Debug.Printf("Joined IPv6 %v", iface.Name)
+	if EnableIPv6LinkLocalMulticast {
+		conn6, err = net.ListenUDP("udp6", AddrIPv6LinkLocalMulticast)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		connIPv6 = ipv6.NewPacketConn(conn6)
+		if err := connIPv6.SetControlMessage(ipv6.FlagInterface, true); err != nil {
+			log.Debug.Printf("IPv6 interface socket opt: %v", err)
+		}
+		// Enable multicast loopback to receive all sent data
+		if err := connIPv6.SetMulticastLoopback(true); err != nil {
+			log.Debug.Println("IPv6 set multicast loopback:", err)
+		}
+		// Set TTL to 255 (rfc6762)
+		if err := connIPv6.SetHopLimit(255); err != nil {
+			log.Debug.Println("IPv4 set TTL:", err)
+		}
+		if err := connIPv6.SetMulticastHopLimit(255); err != nil {
+			log.Debug.Println("IPv4 set multicast TTL:", err)
+		}
+		for _, iface := range MulticastInterfaces(ifs...) {
+			if err := connIPv6.JoinGroup(iface, &net.UDPAddr{IP: IPv6LinkLocalMulticast}); err != nil {
+				log.Debug.Printf("Failed joining IPv6 %v: %v", iface.Name, err)
+			} else {
+				log.Debug.Printf("Joined IPv6 %v", iface.Name)
+			}
 		}
 	}
 

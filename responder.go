@@ -41,7 +41,7 @@ type responder struct {
 	mutex     *sync.Mutex
 	truncated *Request
 	random    *rand.Rand
-	upIfaces  []string
+	upIfaces  map[string][]net.Addr
 }
 
 // NewResponder returns a new mDNS responder.
@@ -55,15 +55,18 @@ func NewResponder() (Responder, error) {
 }
 
 func newResponder(conn MDNSConn) *responder {
-	return &responder{
+	r := &responder{
 		isRunning: false,
 		conn:      conn,
 		unmanaged: []*serviceHandle{},
 		managed:   []*serviceHandle{},
 		mutex:     &sync.Mutex{},
 		random:    rand.New(rand.NewSource(time.Now().UnixNano())),
-		upIfaces:  []string{},
+		upIfaces:  make(map[string][]net.Addr),
 	}
+
+	r.updateUpIfaces()
+	return r
 }
 
 func (r *responder) Remove(h ServiceHandle) {
@@ -121,7 +124,7 @@ func (r *responder) Respond(ctx context.Context) error {
 		return err
 	}
 
-	go r.linkSubscribe(ctx)
+	//go r.linkSubscribe(ctx)
 
 	return r.respond(ctx)
 }
@@ -210,12 +213,18 @@ func (r *responder) respond(ctx context.Context) error {
 	defer readCancel()
 	ch := r.conn.Read(readCtx)
 
+	ticker := time.NewTicker(time.Second * 3)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case req := <-ch:
 			r.mutex.Lock()
 			r.handleRequest(req)
 			r.mutex.Unlock()
+
+		case <-ticker.C:
+			r.handleLinkChange()
 
 		case <-ctx.Done():
 			r.unannounce(services(r.managed))
@@ -224,6 +233,83 @@ func (r *responder) respond(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// RFC 6762, section 8 Probing and Announcing
+// 1、network connectivity changed(Link Change), probing and announcing
+// 2、rdata changed(IP addresses change), re-announce
+func (r *responder) handleLinkChange() {
+	new, changed := r.updateUpIfaces()
+	if len(new) > 0 {
+		// Reprobe all managed services
+		r.mutex.Lock()
+		for i, m := range r.managed {
+			r.managed = append(r.managed[:i], r.managed[i+1:]...)
+			go r.reprobe(m)
+		}
+		r.mutex.Unlock()
+	} else if len(changed) > 0 {
+		// re-announce if necessary
+		for _, iface := range changed {
+			r.mutex.Lock()
+			for _, m := range r.managed {
+				if containsIfaces(iface.Name, m.service.Ifaces) {
+					go r.announceAtInterface(m.service, &iface)
+				}
+			}
+			r.mutex.Unlock()
+		}
+	}
+}
+
+func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
+	newInterface := []net.Interface{}
+	changedInterface := []net.Interface{}
+
+	upIfaces := make(map[string][]net.Addr)
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagRunning == 0 ||
+			iface.Flags&net.FlagMulticast == 0 {
+			continue // Skip down or non-running interfaces
+		}
+
+		news := make([]net.Addr, 0)
+
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if _, _, err := net.ParseCIDR(addr.String()); err == nil {
+				if !EnableIPv6LinkLocalMulticast && isIPv6(addr) {
+					continue // Skip IPv6 link-local addresses if disabled
+				}
+				news = append(news, addr)
+			}
+		}
+
+		if len(news) == 0 {
+			continue // Skip interfaces without addresses
+		}
+
+		upIfaces[iface.Name] = news
+
+		olds, ok := r.upIfaces[iface.Name]
+		if !ok {
+			newInterface = append(newInterface, iface)
+
+			if conn, ok := r.conn.(*mdnsConn); ok {
+				// Join the multicast group for the new interface
+				conn.JoinGroup(&iface)
+			}
+			// log.Info.Println("New interface detected:", iface.Name, "addresses:", news)
+		} else if !compareAddrs(olds, upIfaces[iface.Name]) {
+			changedInterface = append(changedInterface, iface)
+			// log.Info.Println("IP addresses changed: ", iface.Name, "old:", olds, "new:", news)
+		}
+	}
+
+	r.upIfaces = upIfaces
+	return newInterface, changedInterface
 }
 
 func (r *responder) handleRequest(req *Request) {
@@ -519,4 +605,39 @@ func aOrAaaaFilter(service *Service, iface *net.Interface) []dns.RR {
 		}
 	}
 	return result
+}
+
+func compareAddrs(these, those []net.Addr) bool {
+	if len(these) != len(those) {
+		return false
+	}
+
+	for _, this := range these {
+		found := false
+		for _, that := range those {
+			if this.String() == that.String() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isIPv6(a net.Addr) bool {
+	var ip net.IP
+	switch v := a.(type) {
+	case *net.IPNet:
+		ip = v.IP
+	case *net.IPAddr:
+		ip = v.IP
+	default:
+		return false
+	}
+
+	return ip != nil && ip.To4() == nil && ip.To16() != nil
 }
