@@ -38,6 +38,9 @@ var (
 
 	// Enable IPv6 link-local multicast (default: true)
 	EnableIPv6LinkLocalMulticast = true
+
+	// Controls whether the responder should unannounce services when exiting.
+	DisableResponderUnannounceWhileExit = false
 )
 
 // Query is a mDNS query

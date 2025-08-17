@@ -227,7 +227,9 @@ func (r *responder) respond(ctx context.Context) error {
 			r.handleLinkChange()
 
 		case <-ctx.Done():
-			r.unannounce(services(r.managed))
+			if !DisableResponderUnannounceWhileExit {
+				r.unannounce(services(r.managed))
+			}
 			r.conn.Close()
 			r.isRunning = false
 			return ctx.Err()
