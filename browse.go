@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sort"
 	"time"
 )
 
@@ -73,6 +74,48 @@ func (e BrowseEntry) EscapedServiceInstanceName() string {
 // but removes any escape characters.
 func (e BrowseEntry) ServiceInstanceName() string {
 	return fmt.Sprintf("%s.%s.%s.", e.Name, e.Type, e.Domain)
+}
+
+// slicesEqual compares two slices of net.IP for equality regardless of order
+func slicesEqual(a, b []net.IP) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Create sorted copies to compare
+	sortedA := make([]net.IP, len(a))
+	sortedB := make([]net.IP, len(b))
+	copy(sortedA, a)
+	copy(sortedB, b)
+
+	// Sort by string representation for consistent ordering
+	sort.Slice(sortedA, func(i, j int) bool {
+		return sortedA[i].String() < sortedA[j].String()
+	})
+	sort.Slice(sortedB, func(i, j int) bool {
+		return sortedB[i].String() < sortedB[j].String()
+	})
+
+	// Compare sorted slices
+	for i := range sortedA {
+		if !sortedA[i].Equal(sortedB[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// mapsEqual compares two maps of string to string for equality
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func lookupType(ctx context.Context, service string, conn MDNSConn, add AddFunc, rmv RmvFunc, continuous bool, ifaces ...string) (err error) {
@@ -165,13 +208,29 @@ func lookupType(ctx context.Context, service string, conn MDNSConn, add AddFunc,
 
 				for ifaceName, ips := range srv.ifaceIPs {
 					var found = false
-					for _, e := range es {
+					var existingEntry *BrowseEntry = nil
+					var existingIndex = -1
+
+					for i, e := range es {
 						if e.Name == srv.Name && e.IfaceName == ifaceName {
-							found = true
+							existingEntry = e
+							existingIndex = i
+
+							if slicesEqual(e.IPs, ips) && e.Port == srv.Port &&
+								mapsEqual(e.Text, srv.Text) && e.Host == srv.Host {
+								found = true
+							}
 							break
 						}
 					}
+
 					if !found {
+						// remove old entry
+						if existingEntry != nil {
+							rmv(*existingEntry)
+							es = append(es[:existingIndex], es[existingIndex+1:]...)
+						}
+
 						e := BrowseEntry{
 							IPs:       ips,
 							Host:      srv.Host,

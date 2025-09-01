@@ -2,6 +2,7 @@ package dnssd
 
 import (
 	"bytes"
+
 	"github.com/brutella/dnssd/log"
 
 	"fmt"
@@ -398,13 +399,115 @@ func (s Service) ServicesMetaQueryName() string {
 }
 
 func (s *Service) addIP(ip net.IP, iface *net.Interface) {
-	s.IPs = append(s.IPs, ip)
-	if iface != nil {
-		ifaceIPs := []net.IP{ip}
-		if ips, ok := s.ifaceIPs[iface.Name]; ok {
-			ifaceIPs = append(ips, ip)
+	for _, existingIP := range s.IPs {
+		if existingIP.Equal(ip) {
+			goto checkInterface
 		}
-		s.ifaceIPs[iface.Name] = ifaceIPs
+	}
+	// add to global list
+	s.IPs = append(s.IPs, ip)
+
+checkInterface:
+	if iface != nil {
+		if ips, ok := s.ifaceIPs[iface.Name]; ok {
+			for _, existingIP := range ips {
+				if existingIP.Equal(ip) {
+					// This interface already has this IP, don't add again
+					return
+				}
+			}
+			s.ifaceIPs[iface.Name] = append(ips, ip)
+		} else {
+			s.ifaceIPs[iface.Name] = []net.IP{ip}
+		}
+	}
+}
+
+// clearIPv4Records clears all IPv4 addresses from the service
+func (s *Service) clearIPv4Records(iface *net.Interface) {
+	// Clear IPv4 from global IP list
+	newIPs := []net.IP{}
+	for _, ip := range s.IPs {
+		if ip.To4() == nil { // Keep IPv6 addresses
+			newIPs = append(newIPs, ip)
+		}
+	}
+	s.IPs = newIPs
+
+	// Clear IPv4 from interface-specific lists
+	if iface != nil {
+		if ips, ok := s.ifaceIPs[iface.Name]; ok {
+			newIfaceIPs := []net.IP{}
+			for _, ip := range ips {
+				if ip.To4() == nil { // Keep IPv6 addresses
+					newIfaceIPs = append(newIfaceIPs, ip)
+				}
+			}
+			if len(newIfaceIPs) > 0 {
+				s.ifaceIPs[iface.Name] = newIfaceIPs
+			} else {
+				delete(s.ifaceIPs, iface.Name)
+			}
+		}
+	} else {
+		// Clear IPv4 from all interfaces
+		for ifaceName, ips := range s.ifaceIPs {
+			newIfaceIPs := []net.IP{}
+			for _, ip := range ips {
+				if ip.To4() == nil { // Keep IPv6 addresses
+					newIfaceIPs = append(newIfaceIPs, ip)
+				}
+			}
+			if len(newIfaceIPs) > 0 {
+				s.ifaceIPs[ifaceName] = newIfaceIPs
+			} else {
+				delete(s.ifaceIPs, ifaceName)
+			}
+		}
+	}
+}
+
+// clearIPv6Records clears all IPv6 addresses from the service
+func (s *Service) clearIPv6Records(iface *net.Interface) {
+	// Clear IPv6 from global IP list
+	newIPs := []net.IP{}
+	for _, ip := range s.IPs {
+		if ip.To4() != nil { // Keep IPv4 addresses
+			newIPs = append(newIPs, ip)
+		}
+	}
+	s.IPs = newIPs
+
+	// Clear IPv6 from interface-specific lists
+	if iface != nil {
+		if ips, ok := s.ifaceIPs[iface.Name]; ok {
+			newIfaceIPs := []net.IP{}
+			for _, ip := range ips {
+				if ip.To4() != nil { // Keep IPv4 addresses
+					newIfaceIPs = append(newIfaceIPs, ip)
+				}
+			}
+			if len(newIfaceIPs) > 0 {
+				s.ifaceIPs[iface.Name] = newIfaceIPs
+			} else {
+				delete(s.ifaceIPs, iface.Name)
+			}
+		}
+	} else {
+		// Clear IPv6 from all interfaces
+		for ifaceName, ips := range s.ifaceIPs {
+			newIfaceIPs := []net.IP{}
+			for _, ip := range ips {
+				if ip.To4() != nil { // Keep IPv4 addresses
+					newIfaceIPs = append(newIfaceIPs, ip)
+				}
+			}
+			if len(newIfaceIPs) > 0 {
+				s.ifaceIPs[ifaceName] = newIfaceIPs
+			} else {
+				delete(s.ifaceIPs, ifaceName)
+			}
+		}
 	}
 }
 

@@ -30,7 +30,7 @@ func (c *Cache) Services() []*Service {
 }
 
 // UpdateFrom updates the cache from resource records in msg.
-// TODO consider the cache-flush bit to make records as to be deleted in one second
+// Handles cache-flush bit to replace outdated cache entries according to RFC 6762
 func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 	var answers []dns.RR
 	answers = append(answers, req.msg.Answer...)
@@ -38,6 +38,9 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 	sort.Sort(byType(answers))
 
 	for _, answer := range answers {
+		// Check cache-flush bit (bit 15 of Class field)
+		cacheFlush := answer.Header().Class&0x8000 != 0
+
 		switch rr := answer.(type) {
 		case *dns.PTR:
 			ttl := time.Duration(rr.Hdr.Ttl) * time.Second
@@ -81,6 +84,10 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 		case *dns.A:
 			for _, entry := range c.services {
 				if entry.Hostname() == rr.Hdr.Name {
+					if cacheFlush {
+						// Cache-flush bit set: clear all IPv4 records for this hostname, then add new one
+						entry.clearIPv4Records(req.iface)
+					}
 					entry.addIP(rr.A, req.iface)
 				}
 			}
@@ -88,6 +95,10 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 		case *dns.AAAA:
 			for _, entry := range c.services {
 				if entry.Hostname() == rr.Hdr.Name {
+					if cacheFlush {
+						// Cache-flush bit set: clear all IPv6 records for this hostname, then add new one
+						entry.clearIPv6Records(req.iface)
+					}
 					entry.addIP(rr.AAAA, req.iface)
 				}
 			}
@@ -100,18 +111,23 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 					if len(elems) == 2 {
 						key := elems[0]
 						value := elems[1]
-
-						// Don't override existing keys
-						// TODO make txt records case insensitive
-						if _, ok := text[key]; !ok {
-							text[key] = value
-						}
-
 						text[key] = value
 					}
 				}
 
-				entry.Text = text
+				// For TXT records with cache-flush bit, replace entire Text map
+				if cacheFlush {
+					entry.Text = text
+				} else {
+					// Merge with existing text
+					if entry.Text == nil {
+						entry.Text = make(map[string]string)
+					}
+					for k, v := range text {
+						entry.Text[k] = v
+					}
+				}
+
 				entry.TTL = time.Duration(rr.Hdr.Ttl) * time.Second
 				entry.expiration = time.Now().Add(entry.TTL)
 			}
