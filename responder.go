@@ -283,7 +283,7 @@ func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
 		for _, addr := range addrs {
 			if _, _, err := net.ParseCIDR(addr.String()); err == nil {
 				if !EnableIPv6LinkLocalMulticast && isIPv6(addr) {
-					continue // Skip IPv6 link-local addresses if disabled
+					continue // Skip IPv6 addresses if disabled
 				}
 				news = append(news, addr)
 			}
@@ -295,7 +295,9 @@ func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
 
 		upIfaces[iface.Name] = news
 
+		r.mutex.Lock()
 		olds, ok := r.upIfaces[iface.Name]
+		r.mutex.Unlock()
 		if !ok {
 			newInterface = append(newInterface, iface)
 
@@ -304,13 +306,15 @@ func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
 				conn.JoinGroup(&iface)
 			}
 			// log.Info.Println("New interface detected:", iface.Name, "addresses:", news)
-		} else if !compareAddrs(olds, upIfaces[iface.Name]) {
+		} else if !compareAddrs(olds, news) {
 			changedInterface = append(changedInterface, iface)
 			// log.Info.Println("IP addresses changed: ", iface.Name, "old:", olds, "new:", news)
 		}
 	}
 
+	r.mutex.Lock()
 	r.upIfaces = upIfaces
+	r.mutex.Unlock()
 	return newInterface, changedInterface
 }
 
