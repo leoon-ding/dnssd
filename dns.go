@@ -139,7 +139,7 @@ func A(srv Service, iface *net.Interface) []*dns.A {
 
 	var as []*dns.A
 	for _, ip := range ips {
-		if ip.To4() != nil {
+		if ip.To4() != nil && !ip.IsLoopback() {
 			a := &dns.A{
 				Hdr: dns.RR_Header{
 					Name:   srv.Hostname(),
@@ -170,7 +170,7 @@ func AAAA(srv Service, iface *net.Interface) []*dns.AAAA {
 
 	var aaaas []*dns.AAAA
 	for _, ip := range ips {
-		if ip.To4() == nil && ip.To16() != nil {
+		if ip.To4() == nil && ip.To16() != nil && !ip.IsLoopback() {
 			aaaa := &dns.AAAA{
 				Hdr: dns.RR_Header{
 					Name:   srv.Hostname(),
