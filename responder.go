@@ -213,7 +213,7 @@ func (r *responder) respond(ctx context.Context) error {
 	defer readCancel()
 	ch := r.conn.Read(readCtx)
 
-	ticker := time.NewTicker(time.Second * 3)
+	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
 
 	for {
@@ -281,7 +281,8 @@ func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
 
 		addrs, _ := iface.Addrs()
 		for _, addr := range addrs {
-			if _, _, err := net.ParseCIDR(addr.String()); err == nil {
+			switch addr.(type) {
+			case *net.IPNet, *net.IPAddr:
 				if !EnableIPv6LinkLocalMulticast && isIPv6(addr) {
 					continue // Skip IPv6 addresses if disabled
 				}
@@ -295,9 +296,7 @@ func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
 
 		upIfaces[iface.Name] = news
 
-		r.mutex.Lock()
 		olds, ok := r.upIfaces[iface.Name]
-		r.mutex.Unlock()
 		if !ok {
 			newInterface = append(newInterface, iface)
 
@@ -312,9 +311,7 @@ func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
 		}
 	}
 
-	r.mutex.Lock()
 	r.upIfaces = upIfaces
-	r.mutex.Unlock()
 	return newInterface, changedInterface
 }
 
@@ -618,15 +615,15 @@ func compareAddrs(these, those []net.Addr) bool {
 		return false
 	}
 
-	for _, this := range these {
-		found := false
-		for _, that := range those {
-			if this.String() == that.String() {
-				found = true
-				break
-			}
-		}
-		if !found {
+	// Create a set of "those" addresses for O(1) lookup
+	addrSet := make(map[string]bool, len(those))
+	for _, addr := range those {
+		addrSet[addr.String()] = true
+	}
+
+	// Check if all "these" addresses exist in the set
+	for _, addr := range these {
+		if !addrSet[addr.String()] {
 			return false
 		}
 	}
