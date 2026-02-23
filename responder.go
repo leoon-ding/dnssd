@@ -33,6 +33,7 @@ type Responder interface {
 
 type responder struct {
 	isRunning bool
+	runCtx    context.Context
 
 	conn      MDNSConn
 	unmanaged []*serviceHandle
@@ -87,7 +88,12 @@ func (r *responder) Add(srv Service) (ServiceHandle, error) {
 	defer r.mutex.Unlock()
 
 	if r.isRunning {
-		ctx, cancel := context.WithCancel(context.TODO())
+		parent := r.runCtx
+		if parent == nil {
+			parent = context.TODO()
+		}
+
+		ctx, cancel := context.WithCancel(parent)
 		defer cancel()
 
 		srv, err := r.register(ctx, srv)
@@ -105,10 +111,13 @@ func (r *responder) Respond(ctx context.Context) error {
 	r.mutex.Lock()
 	err := func() error {
 		r.isRunning = true
+		r.runCtx = ctx
 		for _, h := range r.unmanaged {
 			log.Debug.Println(h.service)
 			srv, err := r.register(ctx, *h.service)
 			if err != nil {
+				r.isRunning = false
+				r.runCtx = nil
 				return err
 			}
 
@@ -227,11 +236,16 @@ func (r *responder) respond(ctx context.Context) error {
 			r.handleLinkChange()
 
 		case <-ctx.Done():
+			r.mutex.Lock()
+			managed := services(r.managed)
+			r.isRunning = false
+			r.runCtx = nil
+			r.mutex.Unlock()
+
 			if !DisableResponderUnannounceWhileExit {
-				r.unannounce(services(r.managed))
+				r.unannounce(managed)
 			}
 			r.conn.Close()
-			r.isRunning = false
 			return ctx.Err()
 		}
 	}
