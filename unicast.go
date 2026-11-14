@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type legacyEndpoint struct {
 	conn        *net.UDPConn
 	iface       net.Interface
 	network     *net.IPNet
+	networks    []*net.IPNet // current prefixes on this interface
 	destination *net.UDPAddr
 	pending     map[uint16]legacyQuestion // protected by lookupConn.mu
 }
@@ -122,15 +124,10 @@ func (c *lookupConn) SendQuery(q *Query) error {
 	if err != nil {
 		return errors.Join(multicastErr, err)
 	}
-	used := map[bool]bool{}
 	var errs []error
-	for _, a := range addrs {
-		ip, network, err := net.ParseCIDR(a.String())
-		if err != nil || ip.IsLoopback() || ip.IsUnspecified() {
-			continue
-		}
-		v4 := ip.To4() != nil
-		if used[v4] || (!v4 && !EnableIPv6LinkLocalMulticast) {
+	for _, network := range legacyNetworks(addrs, true) {
+		ip := network.IP
+		if ip.To4() == nil && !EnableIPv6LinkLocalMulticast {
 			continue
 		}
 		key := fmt.Sprintf("%d/%s/%s", q.iface.Index, q.iface.Name, ip)
@@ -146,7 +143,7 @@ func (c *lookupConn) SendQuery(q *Query) error {
 			c.workers.Add(1)
 			go func() { defer c.workers.Done(); c.receiveLegacy(e) }()
 		}
-		used[v4] = true
+		e.refreshNetwork(addrs)
 		now := time.Now()
 		for id, p := range e.pending {
 			if !now.Before(p.expires) {
@@ -261,10 +258,12 @@ func (c *lookupConn) receiveLegacy(e *legacyEndpoint) {
 	}
 }
 func validLegacyResponse(m *dns.Msg, from *net.UDPAddr, e *legacyEndpoint, p legacyQuestion, now time.Time) bool {
-	if !m.Response || shouldIgnore(m) || m.Truncated || !now.Before(p.expires) || from.Port != 5353 || len(m.Question) != 1 {
+	// NXDOMAIN is meaningful for the independently queried TXT record.
+	negativeTXT := m.Rcode == dns.RcodeNameError && p.question.Qtype == dns.TypeTXT && len(m.Answer) == 0
+	if !m.Response || m.Opcode != dns.OpcodeQuery || (m.Rcode != dns.RcodeSuccess && !negativeTXT) || m.Truncated || !now.Before(p.expires) || from.Port != 5353 || len(m.Question) != 1 {
 		return false
 	}
-	if !e.network.Contains(from.IP) && !(e.network.IP.To4() == nil && from.IP.IsLinkLocalUnicast()) {
+	if !e.acceptsSource(from) {
 		return false
 	}
 	q := m.Question[0]
@@ -285,11 +284,61 @@ func normalizeLegacyRecords(m *dns.Msg) {
 // refreshNetwork updates the receive filter even if only the prefix changed.
 // The caller holds lookupConn.mu, as does response validation.
 func (e *legacyEndpoint) refreshNetwork(addrs []net.Addr) bool {
+	e.networks = legacyNetworks(addrs, false)
+	for _, network := range e.networks {
+		if network.IP.Equal(e.network.IP) {
+			e.network = network
+			return true
+		}
+	}
+	return false
+}
+
+// Pick a stable source address per prefix, rather than only one per family.
+// Deduplication prevents IPv6 privacy addresses in one prefix multiplying traffic.
+func legacyNetworks(addrs []net.Addr, onePerPrefix bool) []*net.IPNet {
+	var networks []*net.IPNet
 	for _, addr := range addrs {
 		ip, network, err := net.ParseCIDR(addr.String())
-		if err == nil && ip.Equal(e.network.IP) {
-			network.IP = ip
-			e.network = network
+		if err != nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
+			continue
+		}
+		network.IP = ip
+		networks = append(networks, network)
+	}
+	sort.Slice(networks, func(i, j int) bool { return networks[i].String() < networks[j].String() })
+	seen := make(map[string]bool)
+	out := networks[:0]
+	for _, network := range networks {
+		key := network.String()
+		if onePerPrefix {
+			key = (&net.IPNet{IP: network.IP.Mask(network.Mask), Mask: network.Mask}).String()
+		}
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, network)
+		}
+	}
+	return out
+}
+
+func (e *legacyEndpoint) acceptsSource(from *net.UDPAddr) bool {
+	v4 := e.network.IP.To4() != nil
+	if v4 != (from.IP.To4() != nil) {
+		return false
+	}
+	if !v4 && from.Zone != "" && from.Zone != e.iface.Name && from.Zone != fmt.Sprint(e.iface.Index) {
+		return false
+	}
+	if !v4 && from.IP.IsLinkLocalUnicast() {
+		return true
+	}
+	networks := e.networks
+	if networks == nil {
+		networks = []*net.IPNet{e.network}
+	}
+	for _, network := range networks {
+		if network.Contains(from.IP) {
 			return true
 		}
 	}

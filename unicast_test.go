@@ -232,3 +232,104 @@ func TestLegacyPrefixChangeUpdatesSourceFilter(t *testing.T) {
 		t.Fatal("stale broad prefix accepted source")
 	}
 }
+
+func legacyTestAddresses(cidrs ...string) []net.Addr {
+	var out []net.Addr
+	for _, cidr := range cidrs {
+		ip, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(err)
+		}
+		network.IP = ip
+		out = append(out, network)
+	}
+	return out
+}
+
+func TestLegacyEndpointsCoverEveryPrefix(t *testing.T) {
+	addrs := legacyTestAddresses("192.0.2.20/24", "198.51.100.10/24", "192.0.2.10/24", "2001:db8:1::2/64", "2001:db8:1::1/64", "2001:db8:2::1/64", "fe80::1/64", "127.0.0.1/8", "::1/128")
+	expected := []string{"192.0.2.10/24", "198.51.100.10/24", "2001:db8:1::1/64", "2001:db8:2::1/64", "fe80::1/64"}
+	check := func() {
+		got := legacyNetworks(addrs, true)
+		if len(got) != len(expected) {
+			t.Fatalf("prefixes: %v", got)
+		}
+		for i, n := range got {
+			if n.String() != expected[i] {
+				t.Fatalf("prefixes: %v", got)
+			}
+		}
+	}
+	check()
+	for i, j := 0, len(addrs)-1; i < j; i, j = i+1, j-1 {
+		addrs[i], addrs[j] = addrs[j], addrs[i]
+	}
+	check()
+}
+
+func TestLegacySourceFilterTracksAllInterfacePrefixes(t *testing.T) {
+	e := &legacyEndpoint{iface: net.Interface{Name: "test", Index: 7}, network: legacyTestAddresses("192.0.2.10/24")[0].(*net.IPNet)}
+	now := time.Now()
+	q := dns.Question{Name: "_scm._tcp.local.", Qtype: dns.TypePTR, Qclass: dns.ClassINET}
+	p := legacyQuestion{q, now.Add(time.Second)}
+	m := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}, Question: []dns.Question{q}}
+	accepts := func(ip string) bool {
+		return validLegacyResponse(m, &net.UDPAddr{IP: net.ParseIP(ip), Port: 5353}, e, p, now)
+	}
+	if !e.refreshNetwork(legacyTestAddresses("192.0.2.10/24", "198.51.100.10/24")) {
+		t.Fatal("bound address missing")
+	}
+	if !accepts("192.0.2.30") || !accepts("198.51.100.30") || accepts("203.0.113.30") {
+		t.Fatal("incorrect multi-prefix filter")
+	}
+	if !e.refreshNetwork(legacyTestAddresses("192.0.2.10/24")) || accepts("198.51.100.30") {
+		t.Fatal("removed prefix still accepted")
+	}
+	if e.refreshNetwork(legacyTestAddresses("198.51.100.10/24")) {
+		t.Fatal("removed bound address survived")
+	}
+}
+
+func TestLegacyIPv6SourceScope(t *testing.T) {
+	e := &legacyEndpoint{iface: net.Interface{Name: "test", Index: 7}, network: legacyTestAddresses("2001:db8:1::1/64")[0].(*net.IPNet)}
+	e.refreshNetwork(legacyTestAddresses("2001:db8:1::1/64", "2001:db8:2::1/64"))
+	for _, tt := range []struct {
+		ip, zone string
+		want     bool
+	}{
+		{"2001:db8:2::2", "", true}, {"2001:db8:3::2", "", false},
+		{"fe80::2", "test", true}, {"fe80::2", "7", true}, {"fe80::2", "other", false},
+		{"192.0.2.3", "", false},
+	} {
+		if got := e.acceptsSource(&net.UDPAddr{IP: net.ParseIP(tt.ip), Zone: tt.zone}); got != tt.want {
+			t.Fatalf("%+v: %v", tt, got)
+		}
+	}
+}
+
+func TestLegacyNegativeTXTValidation(t *testing.T) {
+	e := &legacyEndpoint{network: legacyTestAddresses("192.0.2.10/24")[0].(*net.IPNet)}
+	now := time.Now()
+	q := dns.Question{Name: "Peer._scm._tcp.local.", Qtype: dns.TypeTXT, Qclass: dns.ClassINET}
+	p := legacyQuestion{q, now.Add(time.Second)}
+	m := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Rcode: dns.RcodeNameError}, Question: []dns.Question{q}}
+	from := &net.UDPAddr{IP: net.ParseIP("192.0.2.20"), Port: 5353}
+	if !validLegacyResponse(m, from, e, p, now) {
+		t.Fatal("explicit TXT absence rejected")
+	}
+	m.Question[0].Name = "Other._scm._tcp.local."
+	if validLegacyResponse(m, from, e, p, now) {
+		t.Fatal("unrelated denial accepted")
+	}
+	m.Question[0] = q
+	m.Opcode = dns.OpcodeUpdate
+	if validLegacyResponse(m, from, e, p, now) {
+		t.Fatal("wrong opcode accepted")
+	}
+	m.Opcode = dns.OpcodeQuery
+	p.question.Qtype = dns.TypeSRV
+	m.Question[0].Qtype = dns.TypeSRV
+	if validLegacyResponse(m, from, e, p, now) {
+		t.Fatal("SRV NXDOMAIN accepted as TXT completion")
+	}
+}
