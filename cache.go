@@ -10,13 +10,17 @@ import (
 
 // Cache stores services in memory.
 type Cache struct {
-	services map[string]*Service
+	services  map[string]*Service
+	addresses map[addressKey]cachedAddress
+	now       func() time.Time
 }
 
 // NewCache returns a new in-memory cache.
 func NewCache() *Cache {
 	return &Cache{
-		services: make(map[string]*Service),
+		services:  make(map[string]*Service),
+		addresses: make(map[addressKey]cachedAddress),
+		now:       time.Now,
 	}
 }
 
@@ -35,11 +39,9 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 	var answers []dns.RR
 	answers = append(answers, req.msg.Answer...)
 	answers = append(answers, req.msg.Extra...)
-	sort.Sort(byType(answers))
+	sort.Stable(byType(answers))
 
 	for _, answer := range answers {
-		// Check cache-flush bit (bit 15 of Class field)
-		cacheFlush := answer.Header().Class&0x8000 != 0
 
 		switch rr := answer.(type) {
 		case *dns.PTR:
@@ -59,7 +61,7 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 			}
 
 			entry.TTL = ttl
-			entry.expiration = time.Now().Add(ttl)
+			entry.expiration = c.now().Add(ttl)
 
 		case *dns.SRV:
 			ttl := time.Duration(rr.Hdr.Ttl) * time.Second
@@ -78,30 +80,8 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 
 			entry.SetHostname(rr.Target)
 			entry.TTL = ttl
-			entry.expiration = time.Now().Add(ttl)
+			entry.expiration = c.now().Add(ttl)
 			entry.Port = int(rr.Port)
-
-		case *dns.A:
-			for _, entry := range c.services {
-				if entry.Hostname() == rr.Hdr.Name {
-					if cacheFlush {
-						// Cache-flush bit set: clear all IPv4 records for this hostname, then add new one
-						entry.clearIPv4Records(req.iface)
-					}
-					entry.addIP(rr.A, req.iface)
-				}
-			}
-
-		case *dns.AAAA:
-			for _, entry := range c.services {
-				if entry.Hostname() == rr.Hdr.Name {
-					if cacheFlush {
-						// Cache-flush bit set: clear all IPv6 records for this hostname, then add new one
-						entry.clearIPv6Records(req.iface)
-					}
-					entry.addIP(rr.AAAA, req.iface)
-				}
-			}
 
 		case *dns.TXT:
 			if entry, ok := c.services[rr.Hdr.Name]; ok {
@@ -115,28 +95,18 @@ func (c *Cache) UpdateFrom(req *Request) (adds []*Service, rmvs []*Service) {
 					}
 				}
 
-				// For TXT records with cache-flush bit, replace entire Text map
-				if cacheFlush {
-					entry.Text = text
-				} else {
-					// Merge with existing text
-					if entry.Text == nil {
-						entry.Text = make(map[string]string)
-					}
-					for k, v := range text {
-						entry.Text[k] = v
-					}
-				}
+				// A TXT RR is a complete value, including when received via legacy unicast.
+				entry.Text = text
 
 				entry.TTL = time.Duration(rr.Hdr.Ttl) * time.Second
-				entry.expiration = time.Now().Add(entry.TTL)
+				entry.expiration = c.now().Add(entry.TTL)
 			}
 		default:
 			// ignore
 		}
 	}
 
-	// TODO remove outdated services regularly
+	c.updateAddresses(req, answers)
 	rmvs = c.removeExpired()
 
 	return
@@ -146,12 +116,13 @@ func (c *Cache) removeExpired() []*Service {
 	var outdated []*Service
 	var services = c.services
 	for key, srv := range services {
-		if time.Now().After(srv.expiration) {
+		if !c.now().Before(srv.expiration) {
 			outdated = append(outdated, srv)
 			delete(c.services, key)
 		}
 	}
 
+	c.expireAddresses()
 	return outdated
 }
 
@@ -160,17 +131,14 @@ type byType []dns.RR
 func (a byType) Len() int      { return len(a) }
 func (a byType) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a byType) Less(i, j int) bool {
-	// Sort in the following order
-	// 1. SRV or PTR
-	// 2. Anything else
-	switch a[i].(type) {
-	case *dns.SRV:
-		return true
-	case *dns.PTR:
-		return true
+	priority := func(rr dns.RR) int {
+		switch rr.(type) {
+		case *dns.PTR, *dns.SRV:
+			return 0
+		}
+		return 1
 	}
-
-	return false
+	return priority(a[i]) < priority(a[j])
 }
 
 // filterRecords returns

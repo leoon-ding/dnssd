@@ -2,7 +2,6 @@ package dnssd
 
 import (
 	"context"
-	"github.com/brutella/dnssd/log"
 	"github.com/miekg/dns"
 	"net"
 	"testing"
@@ -37,30 +36,29 @@ func TestRemove(t *testing.T) {
 }
 
 func TestRegisterServiceWithExplicitIP(t *testing.T) {
+	testIface := testMulticastInterface(t)
 	cfg := Config{
 		Host:   "Computer",
 		Name:   "Test",
 		Type:   "_asdf._tcp",
 		Domain: "local",
 		Port:   12345,
-		Ifaces: []string{"lo0"},
+		Ifaces: []string{testIface.Name},
 	}
 	sv, err := NewService(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sv.ifaceIPs = map[string][]net.IP{
-		"lo0": {net.IP{192, 168, 0, 123}},
+		testIface.Name: {net.IP{192, 168, 0, 123}},
 	}
 
-	conn := newTestConn()
-	otherConn := newTestConn()
-	conn.in = otherConn.out
-	conn.out = otherConn.in
+	conn, otherConn := newTestConnPair(t, testIface)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	startTestResponder(t, ctx, conn, sv)
 	t.Run("resolver", func(t *testing.T) {
-		t.Parallel()
 
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
 
@@ -84,7 +82,7 @@ func TestRegisterServiceWithExplicitIP(t *testing.T) {
 			t.Fatalf("%v != %v", is, want)
 		}
 
-		ips := srv.IPsAtInterface(&net.Interface{Name: "lo0"})
+		ips := srv.IPsAtInterface(&net.Interface{Name: testIface.Name})
 		if is, want := len(ips), 1; is != want {
 			t.Fatalf("%v != %v", is, want)
 		}
@@ -92,14 +90,6 @@ func TestRegisterServiceWithExplicitIP(t *testing.T) {
 		if is, want := ips[0].String(), "192.168.0.123"; is != want {
 			t.Fatalf("%v != %v", is, want)
 		}
-	})
-
-	t.Run("responder", func(t *testing.T) {
-		t.Parallel()
-
-		r := newResponder(conn)
-		r.addManaged(sv) // don't probe
-		r.Respond(ctx)
 	})
 }
 
@@ -109,7 +99,7 @@ type expectedIP struct {
 }
 
 func TestRegisterServiceWithSpecifiedAdvertisedIP(t *testing.T) {
-	log.Debug.Enable()
+	testIface := testMulticastInterface(t)
 
 	v4 := net.IP{192, 168, 0, 123}
 	v6 := net.ParseIP("fe80::1")
@@ -128,7 +118,7 @@ func TestRegisterServiceWithSpecifiedAdvertisedIP(t *testing.T) {
 				Type:            "_asdf._tcp",
 				Domain:          "local",
 				Port:            12345,
-				Ifaces:          []string{"lo0"},
+				Ifaces:          []string{testIface.Name},
 				AdvertiseIPType: expected.advType,
 			}
 			sv, err := NewService(cfg)
@@ -136,17 +126,15 @@ func TestRegisterServiceWithSpecifiedAdvertisedIP(t *testing.T) {
 				t.Fatal(err)
 			}
 			sv.ifaceIPs = map[string][]net.IP{
-				"lo0": {v4, v6},
+				testIface.Name: {v4, v6},
 			}
 
-			conn := newTestConn()
-			otherConn := newTestConn()
-			conn.in = otherConn.out
-			conn.out = otherConn.in
+			conn, otherConn := newTestConnPair(t, testIface)
 
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			startTestResponder(t, ctx, conn, sv)
 			t.Run("resolver", func(t *testing.T) {
-				t.Parallel()
 
 				lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
 
@@ -170,24 +158,15 @@ func TestRegisterServiceWithSpecifiedAdvertisedIP(t *testing.T) {
 					t.Fatalf("%v != %v", is, want)
 				}
 
-				ips := srv.IPsAtInterface(&net.Interface{Name: "lo0"})
+				ips := srv.IPsAtInterface(&net.Interface{Name: testIface.Name})
 				if is, want := len(ips), len(expected.expected); is != want {
 					t.Fatalf("%v != %v", is, want)
 				}
 
-				for i, ip := range ips { // this should always be the same order as a records are processed before aaaa records
-					if is, want := ip, expected.expected[i]; !is.Equal(want) {
-						t.Fatalf("%v != %v", is, want)
-					}
+				if !slicesEqual(ips, expected.expected) {
+					t.Fatalf("addresses=%v want=%v", ips, expected.expected)
 				}
-			})
 
-			t.Run("responder", func(t *testing.T) {
-				t.Parallel()
-
-				r := newResponder(conn)
-				r.addManaged(sv) // don't probe
-				r.Respond(ctx)
 			})
 		})
 	}

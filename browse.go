@@ -111,7 +111,7 @@ func mapsEqual(a, b map[string]string) bool {
 		return false
 	}
 	for k, v := range a {
-		if b[k] != v {
+		if other, ok := b[k]; !ok || other != v {
 			return false
 		}
 	}
@@ -135,138 +135,139 @@ func lookupType(ctx context.Context, service string, conn MDNSConn, add AddFunc,
 
 	ch := conn.Read(readCtx)
 
-	qs := make(chan *Query)
-	go func() {
-		query := func() {
-			for _, iface := range MulticastInterfaces(ifaces...) {
-				iface := iface
-				q := &Query{msg: m.Copy(), iface: iface}
-				qs <- q
-			}
-		}
-
-		// Add random delay（between 20ms and 120ms）for first query
-		time.Sleep(time.Duration(rand.Intn(100)+20) * time.Millisecond)
-
-		if continuous {
-			counter := 0
-			interval := time.Duration(0)
-			for {
-				query()
-
-				if interval < time.Hour {
-					// Exponential backoff: increase the interval
-					interval = time.Duration(1<<counter) * time.Second
-					if interval >= time.Hour || interval < 0 {
-						// If the interval exceeds 60 minutes or is negative (overflow),
-						// Cap the interval to 60 minutes
-						interval = time.Hour
-					}
-				}
-
-				select {
-				case <-time.After(interval):
-					counter += 1
-
-				case <-ctx.Done():
-					return
-				}
-			}
-		} else {
-			query()
-		}
-	}()
+	// Schedule on the receive loop: cancellation cannot strand a query sender.
+	queryTimer := time.NewTimer(time.Duration(rand.Intn(100)+20) * time.Millisecond)
+	defer queryTimer.Stop()
+	interval := time.Second
+	nextQuery := time.Now().Add(120 * time.Millisecond)
+	expiryTicker := time.NewTicker(250 * time.Millisecond)
+	defer expiryTicker.Stop()
 
 	es := []*BrowseEntry{}
-	for {
-		select {
-		case q := <-qs:
-			log.Debug.Printf("Send browsing query at %s\n%s\n", q.IfaceName(), q.msg)
-			// Known-Answer Supression
-			answer := make([]dns.RR, 0)
-			for _, srv := range cache.Services() {
-				if srv.ServiceName() != service {
-					continue
-				}
-
-				if time.Until(srv.expiration) > srv.TTL/2 {
-					answer = append(answer, PTR(*srv))
-				}
-			}
-			q.msg.Answer = answer
-			if err := conn.SendQuery(q); err != nil {
-				log.Debug.Println("SendQuery:", err)
+	syncEntries := func() {
+		for _, srv := range cache.Services() {
+			if srv.ServiceName() != service {
+				continue
 			}
 
-		case req := <-ch:
-			log.Debug.Printf("Receive message at %s\n%s\n", req.IfaceName(), req.msg)
-			cache.UpdateFrom(req)
-			for _, srv := range cache.Services() {
-				if srv.ServiceName() != service {
-					continue
-				}
-
-				for ifaceName, ips := range srv.ifaceIPs {
-					var found = false
-					var existingEntry *BrowseEntry = nil
-					var existingIndex = -1
-
-					for i, e := range es {
-						if e.Name == srv.Name && e.IfaceName == ifaceName {
-							existingEntry = e
-							existingIndex = i
-
-							if slicesEqual(e.IPs, ips) && e.Port == srv.Port &&
-								mapsEqual(e.Text, srv.Text) && e.Host == srv.Host {
-								found = true
-							}
-							break
-						}
-					}
-
-					if !found {
-						// remove old entry
-						if existingEntry != nil {
-							rmv(*existingEntry)
-							es = append(es[:existingIndex], es[existingIndex+1:]...)
-						}
-
-						e := BrowseEntry{
-							IPs:       ips,
-							Host:      srv.Host,
-							Port:      srv.Port,
-							IfaceName: ifaceName,
-							Name:      srv.Name,
-							Type:      srv.Type,
-							Domain:    srv.Domain,
-							Text:      srv.Text,
-						}
-						es = append(es, &e)
-						add(e)
-					}
-				}
-			}
-
-			tmp := []*BrowseEntry{}
-			for _, e := range es {
+			for ifaceName, ips := range srv.ifaceIPs {
 				var found = false
-				for _, srv := range cache.Services() {
-					if srv.ServiceInstanceName() == e.ServiceInstanceName() {
-						found = true
+				var existingEntry *BrowseEntry = nil
+				var existingIndex = -1
+
+				for i, e := range es {
+					if e.Name == srv.Name && e.IfaceName == ifaceName {
+						existingEntry = e
+						existingIndex = i
+
+						if slicesEqual(e.IPs, ips) && e.Port == srv.Port &&
+							mapsEqual(e.Text, srv.Text) && e.Host == srv.Host {
+							found = true
+						}
 						break
 					}
 				}
 
-				if found {
-					tmp = append(tmp, e)
-				} else {
-					// TODO
-					rmv(*e)
+				if !found {
+					// remove old entry
+					if existingEntry != nil {
+						rmv(cloneBrowseEntry(*existingEntry))
+						es = append(es[:existingIndex], es[existingIndex+1:]...)
+					}
+
+					e := BrowseEntry{
+						IPs:       ips,
+						Host:      srv.Host,
+						Port:      srv.Port,
+						IfaceName: ifaceName,
+						Name:      srv.Name,
+						Type:      srv.Type,
+						Domain:    srv.Domain,
+						Text:      srv.Text,
+					}
+					e = cloneBrowseEntry(e)
+					es = append(es, &e)
+					add(cloneBrowseEntry(e))
 				}
 			}
-			es = tmp
+		}
+
+		tmp := []*BrowseEntry{}
+		for _, e := range es {
+			var found = false
+			for _, srv := range cache.Services() {
+				if srv.ServiceInstanceName() == e.ServiceInstanceName() && len(srv.ifaceIPs[e.IfaceName]) > 0 {
+					found = true
+					break
+				}
+			}
+
+			if found {
+				tmp = append(tmp, e)
+			} else {
+				// TODO
+				rmv(cloneBrowseEntry(*e))
+			}
+		}
+		es = tmp
+	}
+	for {
+		select {
+		case <-queryTimer.C:
+			// Do not attach synthesized known answers: the service cache does not
+			// retain per-interface PTR TTLs and cannot safely suppress responses.
+			for _, iface := range MulticastInterfaces(ifaces...) {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if err := conn.SendQuery(&Query{msg: m.Copy(), iface: iface}); err != nil {
+					log.Debug.Println("SendQuery:", err)
+				}
+			}
+			if continuous {
+				delay := cache.refreshDelay(interval, service)
+				queryTimer.Reset(delay)
+				nextQuery = time.Now().Add(delay)
+				interval *= 2
+				if interval > time.Hour {
+					interval = time.Hour
+				}
+			}
+		case <-expiryTicker.C:
+			cache.removeExpired()
+			syncEntries()
+
+		case req, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			log.Debug.Printf("Receive message at %s\n%s\n", req.IfaceName(), req.msg)
+			cache.UpdateFrom(req)
+			if continuous {
+				delay := cache.refreshDelay(interval, service)
+				if deadline := time.Now().Add(delay); deadline.Before(nextQuery) {
+					queryTimer.Reset(delay)
+					nextQuery = deadline
+				}
+			}
+			syncEntries()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
+}
+
+// cloneBrowseEntry isolates cache, comparison state and callback ownership.
+func cloneBrowseEntry(e BrowseEntry) BrowseEntry {
+	ips := make([]net.IP, len(e.IPs))
+	for i, ip := range e.IPs {
+		ips[i] = append(net.IP(nil), ip...)
+	}
+	e.IPs = ips
+	text := make(map[string]string, len(e.Text))
+	for k, v := range e.Text {
+		text[k] = v
+	}
+	e.Text = text
+	return e
 }

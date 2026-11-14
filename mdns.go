@@ -2,6 +2,7 @@ package dnssd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -169,15 +170,17 @@ func (c *mdnsConn) Drain(ctx context.Context) {
 
 // JoinGroup joins the multicast group for the specified interface.
 func (c *mdnsConn) JoinGroup(iface *net.Interface) error {
+	if c.ipv4 == nil && c.ipv6 == nil {
+		return fmt.Errorf("no suitable connection for %s", iface.Name)
+	}
+	var errs []error
 	if c.ipv4 != nil {
-		return c.ipv4.JoinGroup(iface, &net.UDPAddr{IP: IPv4LinkLocalMulticast})
+		errs = append(errs, c.ipv4.JoinGroup(iface, &net.UDPAddr{IP: IPv4LinkLocalMulticast}))
 	}
-
 	if c.ipv6 != nil {
-		return c.ipv6.JoinGroup(iface, &net.UDPAddr{IP: IPv6LinkLocalMulticast})
+		errs = append(errs, c.ipv6.JoinGroup(iface, &net.UDPAddr{IP: IPv6LinkLocalMulticast}))
 	}
-
-	return fmt.Errorf("no suitable connection for %s", iface.Name)
+	return errors.Join(errs...)
 }
 
 // Close closes the mDNS connection.

@@ -270,20 +270,16 @@ func (s *Service) HasIPOnAnyInterface(ip net.IP) bool {
 
 // Copy returns a copy of the service.
 func (s Service) Copy() *Service {
-	return &Service{
-		Name:            s.Name,
-		Type:            s.Type,
-		Domain:          s.Domain,
-		Host:            s.Host,
-		Text:            s.Text,
-		TTL:             s.TTL,
-		IPs:             s.IPs,
-		Port:            s.Port,
-		AdvertiseIPType: s.AdvertiseIPType,
-		Ifaces:          s.Ifaces,
-		ifaceIPs:        s.ifaceIPs,
-		expiration:      s.expiration,
+	copy := s
+	e := cloneBrowseEntry(BrowseEntry{IPs: s.IPs, Text: s.Text})
+	copy.IPs = e.IPs
+	copy.Text = e.Text
+	copy.Ifaces = append([]string(nil), s.Ifaces...)
+	copy.ifaceIPs = make(map[string][]net.IP, len(s.ifaceIPs))
+	for name, ips := range s.ifaceIPs {
+		copy.ifaceIPs[name] = cloneBrowseEntry(BrowseEntry{IPs: ips}).IPs
 	}
+	return &copy
 }
 
 func (s Service) EscapedName() string {
@@ -423,92 +419,49 @@ checkInterface:
 	}
 }
 
-// clearIPv4Records clears all IPv4 addresses from the service
-func (s *Service) clearIPv4Records(iface *net.Interface) {
-	// Clear IPv4 from global IP list
-	newIPs := []net.IP{}
+// clearIPv4Records clears IPv4 records in the specified interface scope.
+func (s *Service) clearIPv4Records(iface *net.Interface) { s.clearIPRecords(iface, true) }
+func (s *Service) clearIPv6Records(iface *net.Interface) { s.clearIPRecords(iface, false) }
+func (s *Service) clearIPRecords(iface *net.Interface, v4 bool) {
+	removed := []net.IP{}
+	for name, ips := range s.ifaceIPs {
+		if iface != nil && name != iface.Name {
+			continue
+		}
+		kept := []net.IP{}
+		for _, ip := range ips {
+			if (ip.To4() != nil) == v4 {
+				removed = append(removed, ip)
+			} else {
+				kept = append(kept, ip)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.ifaceIPs, name)
+		} else {
+			s.ifaceIPs[name] = kept
+		}
+	}
+	kept := []net.IP{}
 	for _, ip := range s.IPs {
-		if ip.To4() == nil { // Keep IPv6 addresses
-			newIPs = append(newIPs, ip)
+		drop := iface == nil && (ip.To4() != nil) == v4
+		for _, old := range removed {
+			if ip.Equal(old) {
+				drop = true
+			}
 		}
-	}
-	s.IPs = newIPs
-
-	// Clear IPv4 from interface-specific lists
-	if iface != nil {
-		if ips, ok := s.ifaceIPs[iface.Name]; ok {
-			newIfaceIPs := []net.IP{}
-			for _, ip := range ips {
-				if ip.To4() == nil { // Keep IPv6 addresses
-					newIfaceIPs = append(newIfaceIPs, ip)
+		for _, ips := range s.ifaceIPs {
+			for _, other := range ips {
+				if ip.Equal(other) {
+					drop = false
 				}
 			}
-			if len(newIfaceIPs) > 0 {
-				s.ifaceIPs[iface.Name] = newIfaceIPs
-			} else {
-				delete(s.ifaceIPs, iface.Name)
-			}
 		}
-	} else {
-		// Clear IPv4 from all interfaces
-		for ifaceName, ips := range s.ifaceIPs {
-			newIfaceIPs := []net.IP{}
-			for _, ip := range ips {
-				if ip.To4() == nil { // Keep IPv6 addresses
-					newIfaceIPs = append(newIfaceIPs, ip)
-				}
-			}
-			if len(newIfaceIPs) > 0 {
-				s.ifaceIPs[ifaceName] = newIfaceIPs
-			} else {
-				delete(s.ifaceIPs, ifaceName)
-			}
+		if !drop {
+			kept = append(kept, ip)
 		}
 	}
-}
-
-// clearIPv6Records clears all IPv6 addresses from the service
-func (s *Service) clearIPv6Records(iface *net.Interface) {
-	// Clear IPv6 from global IP list
-	newIPs := []net.IP{}
-	for _, ip := range s.IPs {
-		if ip.To4() != nil { // Keep IPv4 addresses
-			newIPs = append(newIPs, ip)
-		}
-	}
-	s.IPs = newIPs
-
-	// Clear IPv6 from interface-specific lists
-	if iface != nil {
-		if ips, ok := s.ifaceIPs[iface.Name]; ok {
-			newIfaceIPs := []net.IP{}
-			for _, ip := range ips {
-				if ip.To4() != nil { // Keep IPv4 addresses
-					newIfaceIPs = append(newIfaceIPs, ip)
-				}
-			}
-			if len(newIfaceIPs) > 0 {
-				s.ifaceIPs[iface.Name] = newIfaceIPs
-			} else {
-				delete(s.ifaceIPs, iface.Name)
-			}
-		}
-	} else {
-		// Clear IPv6 from all interfaces
-		for ifaceName, ips := range s.ifaceIPs {
-			newIfaceIPs := []net.IP{}
-			for _, ip := range ips {
-				if ip.To4() != nil { // Keep IPv4 addresses
-					newIfaceIPs = append(newIfaceIPs, ip)
-				}
-			}
-			if len(newIfaceIPs) > 0 {
-				s.ifaceIPs[ifaceName] = newIfaceIPs
-			} else {
-				delete(s.ifaceIPs, ifaceName)
-			}
-		}
-	}
+	s.IPs = kept
 }
 
 func newService(instance string) *Service {
