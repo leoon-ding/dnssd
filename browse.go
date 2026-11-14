@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"runtime"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -32,33 +34,33 @@ type RmvFunc func(BrowseEntry)
 
 // LookupType browses for service instances.
 func LookupType(ctx context.Context, service string, add AddFunc, rmv RmvFunc) (err error) {
-	conn, err := newMDNSConn()
+	conn, err := newLookupConn(ctx, runtime.GOOS == "windows")
 	if err != nil {
 		return err
 	}
-	defer conn.close()
+	defer conn.Close()
 
 	return lookupType(ctx, service, conn, add, rmv, false)
 }
 
 // LookupTypeAtInterface browses for service instances at specific network interfaces.
 func LookupTypeAtInterfaces(ctx context.Context, service string, add AddFunc, rmv RmvFunc, ifaces ...string) (err error) {
-	conn, err := newMDNSConn(ifaces...)
+	conn, err := newLookupConn(ctx, runtime.GOOS == "windows", ifaces...)
 	if err != nil {
 		return err
 	}
-	defer conn.close()
+	defer conn.Close()
 
 	return lookupType(ctx, service, conn, add, rmv, false, ifaces...)
 }
 
 // LookupTypeContinuously brwoses for service instances using Continuous Multicast DNS Querying
 func LookupTypeContinuously(ctx context.Context, service string, add AddFunc, rmv RmvFunc) (err error) {
-	conn, err := newMDNSConn()
+	conn, err := newLookupConn(ctx, runtime.GOOS == "windows")
 	if err != nil {
 		return err
 	}
-	defer conn.close()
+	defer conn.Close()
 
 	return lookupType(ctx, service, conn, add, rmv, true)
 }
@@ -142,6 +144,10 @@ func lookupType(ctx context.Context, service string, conn MDNSConn, add AddFunc,
 	nextQuery := time.Now().Add(120 * time.Millisecond)
 	expiryTicker := time.NewTicker(250 * time.Millisecond)
 	defer expiryTicker.Stop()
+	networkTicker := time.NewTicker(2 * time.Second)
+	defer networkTicker.Stop()
+	networkState := browseNetworkState(ifaces...)
+	lastNetworkCheck := time.Now()
 
 	es := []*BrowseEntry{}
 	syncEntries := func() {
@@ -233,6 +239,19 @@ func lookupType(ctx context.Context, service string, conn MDNSConn, add AddFunc,
 					interval = time.Hour
 				}
 			}
+		case now := <-networkTicker.C:
+			state := browseNetworkState(ifaces...)
+			// A delayed ticker may be the first activity after system resume.
+			resumed := now.UnixNano()-lastNetworkCheck.UnixNano() > int64(5*time.Second)
+			lastNetworkCheck = now
+			if state != networkState || resumed {
+				networkState = state
+				if continuous {
+					interval = time.Second
+					queryTimer.Reset(time.Millisecond)
+					nextQuery = time.Now().Add(time.Millisecond)
+				}
+			}
 		case <-expiryTicker.C:
 			cache.removeExpired()
 			syncEntries()
@@ -270,4 +289,36 @@ func cloneBrowseEntry(e BrowseEntry) BrowseEntry {
 	}
 	e.Text = text
 	return e
+}
+
+// BrowseOptions controls an explicitly configured browser. Existing browse
+// APIs enable legacy unicast queries by default on Windows only.
+type BrowseOptions struct {
+	Interfaces []string
+	Continuous bool
+	// LegacyUnicast adds ephemeral-port queries alongside multicast browsing.
+	// Requests still use multicast; this cannot discover unknown hosts when
+	// outbound multicast is blocked.
+	LegacyUnicast bool
+}
+
+func LookupTypeWithOptions(ctx context.Context, service string, add AddFunc, rmv RmvFunc, options BrowseOptions) error {
+	conn, err := newLookupConn(ctx, options.LegacyUnicast, options.Interfaces...)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return lookupType(ctx, service, conn, add, rmv, options.Continuous, options.Interfaces...)
+}
+
+func browseNetworkState(filters ...string) string {
+	var state []string
+	for _, iface := range MulticastInterfaces(filters...) {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			state = append(state, fmt.Sprintf("%d/%s/%s", iface.Index, iface.Name, addr))
+		}
+	}
+	sort.Strings(state)
+	return strings.Join(state, ";")
 }

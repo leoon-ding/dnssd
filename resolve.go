@@ -2,6 +2,7 @@ package dnssd
 
 import (
 	"context"
+	"runtime"
 
 	"github.com/brutella/dnssd/log"
 	"github.com/miekg/dns"
@@ -11,11 +12,12 @@ import (
 func LookupInstance(ctx context.Context, instance string) (Service, error) {
 	var srv Service
 
-	conn, err := NewMDNSConn()
+	conn, err := newLookupConn(ctx, runtime.GOOS == "windows")
 	if err != nil {
 		return srv, err
 	}
 
+	defer conn.Close()
 	return lookupInstance(ctx, instance, conn)
 }
 
@@ -49,7 +51,11 @@ func lookupInstance(ctx context.Context, instance string, conn MDNSConn) (srv Se
 		for _, iface := range MulticastInterfaces() {
 			iface := iface
 			q := &Query{msg: m, iface: iface}
-			qs <- q
+			select {
+			case qs <- q:
+			case <-readCtx.Done():
+				return
+			}
 		}
 	}()
 

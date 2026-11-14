@@ -453,7 +453,8 @@ func (r *responder) handleQuery(req *Request, services []*Service) {
 
 		// Legacy unicast response MUST be a conventional DNS server response (and thus, includes the question).
 		if isLegacyUnicastSource(req.from) {
-			msg.Question = []dns.Question{q}
+			msg.Question = append([]dns.Question(nil), req.msg.Question...)
+			normalizeLegacyRecords(msg)
 		} else {
 			msg.Question = nil
 		}

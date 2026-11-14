@@ -138,3 +138,39 @@ Twitter: [https://twitter.com/brutella](https://twitter.com/brutella)
 # License
 
 *dnssd* is available under the MIT license. See the LICENSE file for more info.
+
+
+### Windows LAN discovery and legacy unicast
+
+On Windows, the existing browse APIs and `LookupInstance` also query from
+independent ephemeral UDP ports. This avoids depending on which process owns
+unicast replies to shared port 5353. Multicast listening and announcements are
+retained. Other platforms keep multicast-only browsing by default.
+
+Use explicit options to enable or disable the extra query path per browser:
+
+```go
+err := dnssd.LookupTypeWithOptions(ctx, "_scm._tcp.local.", onAdd, onRemove,
+    dnssd.BrowseOptions{
+        Continuous: true,
+        LegacyUnicast: true,
+        // Interfaces: []string{"eth0"},
+    })
+```
+
+The zero value of `BrowseOptions` does not enable legacy queries, even on
+Windows. Sockets bind to a local address on each selected interface and share
+the normal browse cache. Legacy replies must match a pending transaction and
+question, come from port 5353 on the local link, and are cached for at most
+10 seconds. Continuous browsing refreshes these short-lived records. Interface
+changes reset continuous-query backoff; stale bound sockets close on the next
+query. Cancelling the browse closes its sockets and stops its forwarding workers.
+
+This is still multicast-assisted discovery: outbound multicast queries must
+reach the peer. It does not replace global discovery when multicast is blocked
+in both directions. Cache removal is a discovery event, not proof that an
+established application connection has failed.
+
+Run unit tests with `go test -race ./...`. On a host permitting LAN multicast,
+set `DNSSD_TEST_MULTICAST=1` to also run real-socket tests, including discovery
+with the multicast receive path deliberately silent and dual-path deduplication.

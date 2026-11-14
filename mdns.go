@@ -305,6 +305,9 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				n, cm, from, err := c.ipv4.ReadFrom(buf)
 				if err != nil {
+					if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+						return
+					}
 					continue
 				}
 
@@ -331,8 +334,12 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				if n > 0 {
 					m := new(dns.Msg)
-					if err := m.Unpack(buf); err == nil && !shouldIgnore(m) {
-						ch <- &Request{m, udpAddr, iface}
+					if err := m.Unpack(buf[:n]); err == nil && !shouldIgnore(m) {
+						select {
+						case ch <- &Request{m, udpAddr, iface}:
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 			}
@@ -349,6 +356,9 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				n, cm, from, err := c.ipv6.ReadFrom(buf)
 				if err != nil {
+					if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+						return
+					}
 					continue
 				}
 
@@ -376,8 +386,12 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				if n > 0 {
 					m := new(dns.Msg)
-					if err := m.Unpack(buf); err == nil && !shouldIgnore(m) {
-						ch <- &Request{m, udpAddr, iface}
+					if err := m.Unpack(buf[:n]); err == nil && !shouldIgnore(m) {
+						select {
+						case ch <- &Request{m, udpAddr, iface}:
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 			}
@@ -398,8 +412,11 @@ func (c *mdnsConn) sendResponse(m *dns.Msg, iface *net.Interface) error {
 }
 
 func (c *mdnsConn) sendResponseTo(m *dns.Msg, iface *net.Interface, addr *net.UDPAddr) error {
-	// Don't sanitize legacy unicast responses.
-	if !isLegacyUnicastSource(addr) {
+	// Keep the legacy ID and questions while normalizing record TTLs/classes.
+	if isLegacyUnicastSource(addr) {
+		m = m.Copy()
+		normalizeLegacyRecords(m)
+	} else {
 		sanitizeResponse(m)
 	}
 
