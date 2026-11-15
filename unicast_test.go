@@ -2,10 +2,12 @@ package dnssd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/miekg/dns"
 	"net"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -246,11 +248,11 @@ func legacyTestAddresses(cidrs ...string) []net.Addr {
 	return out
 }
 
-func TestLegacyEndpointsCoverEveryPrefix(t *testing.T) {
+func TestLegacyAddressCandidatesRetainAlternatives(t *testing.T) {
 	addrs := legacyTestAddresses("192.0.2.20/24", "198.51.100.10/24", "192.0.2.10/24", "2001:db8:1::2/64", "2001:db8:1::1/64", "2001:db8:2::1/64", "fe80::1/64", "127.0.0.1/8", "::1/128")
-	expected := []string{"192.0.2.10/24", "198.51.100.10/24", "2001:db8:1::1/64", "2001:db8:2::1/64", "fe80::1/64"}
+	expected := []string{"192.0.2.10/24", "192.0.2.20/24", "198.51.100.10/24", "2001:db8:1::1/64", "2001:db8:1::2/64", "2001:db8:2::1/64", "fe80::1/64"}
 	check := func() {
-		got := legacyNetworks(addrs, true)
+		got := legacyNetworks(addrs)
 		if len(got) != len(expected) {
 			t.Fatalf("prefixes: %v", got)
 		}
@@ -331,5 +333,93 @@ func TestLegacyNegativeTXTValidation(t *testing.T) {
 	m.Question[0].Qtype = dns.TypeSRV
 	if validLegacyResponse(m, from, e, p, now) {
 		t.Fatal("SRV NXDOMAIN accepted as TXT completion")
+	}
+}
+
+func TestLegacyEndpointBindFallback(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		cidrs []string
+	}{
+		{"ipv4", []string{"192.0.2.10/24", "192.0.2.20/24", "192.0.2.30/24", "198.51.100.10/24"}},
+		{"ipv6", []string{"2001:db8:1::1/64", "2001:db8:1::2/64", "2001:db8:1::3/64", "2001:db8:2::1/64"}},
+	} {
+		for _, failCount := range []int{0, 1, 3} {
+			t.Run(fmt.Sprintf("%s/fail-%d", tt.name, failCount), func(t *testing.T) {
+				sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sink.Close()
+				c := addLegacyQueries(context.Background(), &forkConn{requests: make(chan *Request)})
+				defer c.Close()
+				iface := &net.Interface{Name: "bind-fallback", Index: 7}
+				q := &Query{iface: iface, msg: &dns.Msg{Question: []dns.Question{{Name: "_test._tcp.local.", Qtype: dns.TypePTR, Qclass: dns.ClassINET}}}}
+				addrs := legacyTestAddresses(tt.cidrs...)
+				// Enumeration order must not change the deterministic fallback sequence.
+				for i, j := 0, len(addrs)-1; i < j; i, j = i+1, j-1 {
+					addrs[i], addrs[j] = addrs[j], addrs[i]
+				}
+				bindErr := errors.New("injected bind failure")
+				var attempts []string
+				open := func(iface *net.Interface, network *net.IPNet) (*legacyEndpoint, error) {
+					attempts = append(attempts, network.String())
+					for i := 0; i < failCount; i++ {
+						if network.String() == tt.cidrs[i] {
+							return nil, bindErr
+						}
+					}
+					socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+					if err != nil {
+						return nil, err
+					}
+					// Only binding is substituted. The production query packing, sending,
+					// pending transactions, endpoint registration and cleanup all run.
+					return &legacyEndpoint{conn: socket, iface: *iface, network: network, destination: sink.LocalAddr().(*net.UDPAddr), pending: make(map[uint16]legacyQuestion)}, nil
+				}
+				c.mu.Lock()
+				err = c.sendLegacyQueries(q, addrs, open)
+				endpointCount := len(c.endpoints)
+				c.mu.Unlock()
+				if (failCount > 0) != errors.Is(err, bindErr) {
+					t.Fatalf("unexpected bind diagnostics: %v", err)
+				}
+				stop := failCount + 1
+				if stop > 3 {
+					stop = 3
+				}
+				expected := append(append([]string(nil), tt.cidrs[:stop]...), tt.cidrs[3])
+				if !reflect.DeepEqual(attempts, expected) {
+					t.Fatalf("attempts=%v want=%v", attempts, expected)
+				}
+				wantEndpoints := 2
+				if failCount == 3 {
+					wantEndpoints = 1
+				}
+				if endpointCount != wantEndpoints {
+					t.Fatalf("endpoints=%d want=%d", endpointCount, wantEndpoints)
+				}
+				sink.SetReadDeadline(time.Now().Add(time.Second))
+				sources := make(map[string]bool)
+				packet := make([]byte, 1500)
+				for i := 0; i < wantEndpoints; i++ {
+					n, source, err := sink.ReadFromUDP(packet)
+					if err != nil {
+						t.Fatalf("successful fallback did not send: %v", err)
+					}
+					m := new(dns.Msg)
+					if err := m.Unpack(packet[:n]); err != nil {
+						t.Fatal(err)
+					}
+					if len(m.Question) != 1 || m.Question[0] != q.msg.Question[0] {
+						t.Fatalf("wrong query: %v", m)
+					}
+					sources[source.String()] = true
+				}
+				if len(sources) != wantEndpoints {
+					t.Fatalf("queries did not come from distinct endpoints: %v", sources)
+				}
+			})
+		}
 	}
 }

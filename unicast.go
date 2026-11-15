@@ -124,17 +124,30 @@ func (c *lookupConn) SendQuery(q *Query) error {
 	if err != nil {
 		return errors.Join(multicastErr, err)
 	}
+	return errors.Join(multicastErr, c.sendLegacyQueries(q, addrs, openLegacyEndpoint))
+}
+
+// sendLegacyQueries retains every address until an endpoint for its prefix has
+// opened successfully. The caller holds c.mu; open is injectable without global
+// state so tests can exercise binding failures on the actual send path.
+func (c *lookupConn) sendLegacyQueries(q *Query, addrs []net.Addr, open func(*net.Interface, *net.IPNet) (*legacyEndpoint, error)) error {
 	var errs []error
-	for _, network := range legacyNetworks(addrs, true) {
+	used := make(map[string]bool)
+	for _, network := range legacyNetworks(addrs) {
 		ip := network.IP
 		if ip.To4() == nil && !EnableIPv6LinkLocalMulticast {
+			continue
+		}
+		prefix := (&net.IPNet{IP: ip.Mask(network.Mask), Mask: network.Mask}).String()
+		if used[prefix] {
 			continue
 		}
 		key := fmt.Sprintf("%d/%s/%s", q.iface.Index, q.iface.Name, ip)
 		e := c.endpoints[key]
 		if e == nil {
 			network.IP = ip
-			e, err = openLegacyEndpoint(q.iface, network)
+			var err error
+			e, err = open(q.iface, network)
 			if err != nil {
 				errs = append(errs, err)
 				continue
@@ -143,6 +156,7 @@ func (c *lookupConn) SendQuery(q *Query) error {
 			c.workers.Add(1)
 			go func() { defer c.workers.Done(); c.receiveLegacy(e) }()
 		}
+		used[prefix] = true
 		e.refreshNetwork(addrs)
 		now := time.Now()
 		for id, p := range e.pending {
@@ -183,7 +197,7 @@ func (c *lookupConn) SendQuery(q *Query) error {
 	if err := errors.Join(errs...); err != nil {
 		log.Debug.Println("Legacy query:", err)
 	}
-	return errors.Join(append(errs, multicastErr)...)
+	return errors.Join(errs...)
 }
 
 func openLegacyEndpoint(iface *net.Interface, network *net.IPNet) (*legacyEndpoint, error) {
@@ -284,7 +298,7 @@ func normalizeLegacyRecords(m *dns.Msg) {
 // refreshNetwork updates the receive filter even if only the prefix changed.
 // The caller holds lookupConn.mu, as does response validation.
 func (e *legacyEndpoint) refreshNetwork(addrs []net.Addr) bool {
-	e.networks = legacyNetworks(addrs, false)
+	e.networks = legacyNetworks(addrs)
 	for _, network := range e.networks {
 		if network.IP.Equal(e.network.IP) {
 			e.network = network
@@ -294,9 +308,9 @@ func (e *legacyEndpoint) refreshNetwork(addrs []net.Addr) bool {
 	return false
 }
 
-// Pick a stable source address per prefix, rather than only one per family.
-// Deduplication prevents IPv6 privacy addresses in one prefix multiplying traffic.
-func legacyNetworks(addrs []net.Addr, onePerPrefix bool) []*net.IPNet {
+// Return stable address candidates, retaining alternatives in the same prefix.
+// Prefix deduplication happens only after successfully opening an endpoint.
+func legacyNetworks(addrs []net.Addr) []*net.IPNet {
 	var networks []*net.IPNet
 	for _, addr := range addrs {
 		ip, network, err := net.ParseCIDR(addr.String())
@@ -311,9 +325,6 @@ func legacyNetworks(addrs []net.Addr, onePerPrefix bool) []*net.IPNet {
 	out := networks[:0]
 	for _, network := range networks {
 		key := network.String()
-		if onePerPrefix {
-			key = (&net.IPNet{IP: network.IP.Mask(network.Mask), Mask: network.Mask}).String()
-		}
 		if !seen[key] {
 			seen[key] = true
 			out = append(out, network)
