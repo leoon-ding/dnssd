@@ -149,6 +149,12 @@ func (r *responder) announce(services []*Service) {
 }
 
 func (r *responder) announceAtInterface(service *Service, iface *net.Interface) {
+	r.mutex.Lock()
+	ctx := r.runCtx
+	r.mutex.Unlock()
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
 	ips := service.IPsAtInterface(iface)
 	if len(ips) == 0 {
 		log.Debug.Printf("No IPs for service %s at %s\n", service.ServiceInstanceName(), iface.Name)
@@ -174,7 +180,13 @@ func (r *responder) announceAtInterface(service *Service, iface *net.Interface) 
 	if err := r.conn.SendResponse(resp); err != nil {
 		log.Debug.Println("1st announcement:", err)
 	}
-	time.Sleep(1 * time.Second)
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
 	log.Debug.Println("Sending 2nd announcement", msg)
 	if err := r.conn.SendResponse(resp); err != nil {
 		log.Debug.Println("2nd announcement:", err)
@@ -194,7 +206,7 @@ func (r *responder) register(ctx context.Context, srv Service) (Service, error) 
 
 	srvs := []*Service{&probed}
 	for _, h := range r.managed {
-		srvs = append(srvs, h.service)
+		srvs = append(srvs, h.service.Copy())
 	}
 	go r.announce(srvs)
 
@@ -259,8 +271,8 @@ func (r *responder) handleLinkChange() {
 	if len(new) > 0 {
 		// Reprobe all managed services
 		r.mutex.Lock()
-		for i, m := range r.managed {
-			r.managed = append(r.managed[:i], r.managed[i+1:]...)
+		pending := r.takeManaged()
+		for _, m := range pending {
 			go r.reprobe(m)
 		}
 		r.mutex.Unlock()
@@ -269,8 +281,10 @@ func (r *responder) handleLinkChange() {
 		for _, iface := range changed {
 			r.mutex.Lock()
 			for _, m := range r.managed {
-				if containsIfaces(iface.Name, m.service.Ifaces) {
-					go r.announceAtInterface(m.service, &iface)
+				if len(m.service.Ifaces) == 0 || containsIfaces(iface.Name, m.service.Ifaces) {
+					service := m.service.Copy()
+					iface := iface
+					go r.announceAtInterface(service, &iface)
 				}
 			}
 			r.mutex.Unlock()
@@ -316,7 +330,11 @@ func (r *responder) updateUpIfaces() ([]net.Interface, []net.Interface) {
 
 			if conn, ok := r.conn.(*mdnsConn); ok {
 				// Join the multicast group for the new interface
-				conn.JoinGroup(&iface)
+				if err := conn.JoinGroup(&iface); err != nil {
+					log.Debug.Println("JoinGroup:", err)
+					// Membership failure does not make an observed interface new.
+					// In particular, initial memberships may already exist.
+				}
 			}
 			// log.Info.Println("New interface detected:", iface.Name, "addresses:", news)
 		} else if !compareAddrs(olds, news) {
@@ -435,7 +453,8 @@ func (r *responder) handleQuery(req *Request, services []*Service) {
 
 		// Legacy unicast response MUST be a conventional DNS server response (and thus, includes the question).
 		if isLegacyUnicastSource(req.from) {
-			msg.Question = []dns.Question{q}
+			msg.Question = append([]dns.Question(nil), req.msg.Question...)
+			normalizeLegacyRecords(msg)
 		} else {
 			msg.Question = nil
 		}
@@ -462,22 +481,31 @@ func (r *responder) handleQuery(req *Request, services []*Service) {
 }
 
 func (r *responder) reprobe(h *serviceHandle) {
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
+	r.mutex.Lock()
+	ctx := r.runCtx
+	srv := h.service.Copy()
+	r.mutex.Unlock()
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
 
-	probed, err := ReprobeService(ctx, *h.service)
+	probed, err := ReprobeService(ctx, *srv)
 	if err != nil {
 		return
 	}
-	h.service = &probed
-
 	r.mutex.Lock()
-	managed := append(r.managed, h)
-	r.managed = managed
+	if ctx.Err() != nil || !r.isRunning {
+		r.mutex.Unlock()
+		return
+	}
+	h.service = &probed
+	r.managed = append(r.managed, h)
+	announced := make([]*Service, 0, len(r.managed))
+	for _, handle := range r.managed {
+		announced = append(announced, handle.service.Copy())
+	}
 	r.mutex.Unlock()
-
-	log.Debug.Println("Reannouncing services", managed)
-	go r.announce(services(managed))
+	go r.announce(announced)
 }
 
 func (r *responder) handleQuestion(q dns.Question, req *Request, srv Service) *dns.Msg {
@@ -657,4 +685,11 @@ func isIPv6(a net.Addr) bool {
 	}
 
 	return ip != nil && ip.To4() == nil && ip.To16() != nil
+}
+
+// takeManaged detaches the entire batch before reprobing. Caller holds mutex.
+func (r *responder) takeManaged() []*serviceHandle {
+	pending := r.managed
+	r.managed = nil
+	return pending
 }

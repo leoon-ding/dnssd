@@ -11,13 +11,7 @@ import (
 )
 
 func TestBrowse(t *testing.T) {
-	testIface, _ := net.InterfaceByName("lo0")
-	if testIface == nil {
-		testIface, _ = net.InterfaceByName("lo")
-	}
-	if testIface == nil {
-		t.Fatal("can not find the local interface")
-	}
+	testIface := testMulticastInterface(t)
 
 	localhost, err := os.Hostname()
 	if err != nil {
@@ -43,33 +37,36 @@ func TestBrowse(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			rs, err := NewResponder()
-			if err != nil {
-				t.Fatal(err)
-			}
+			srv.ifaceIPs = map[string][]net.IP{testIface.Name: {net.ParseIP("192.0.2.10")}}
+			conn, browser := newTestConnPair(t, testIface)
+			startTestResponder(t, ctx, conn, srv)
 
+			resultChan := make(chan BrowseEntry, 1)
+			browseDone := make(chan error, 1)
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-browseDone:
+				case <-time.After(time.Second):
+					t.Error("browser did not stop")
+				}
+			})
 			go func() {
-				_ = rs.Respond(ctx)
-			}()
-
-			_, err = rs.Add(srv)
-			if err != nil {
-				t.Fatal(err)
-
-			}
-
-			resultChan := make(chan BrowseEntry)
-			defer close(resultChan)
-			go func() {
-				_ = LookupType(ctx, fmt.Sprintf("%s.local.", cfg.Type), func(entry BrowseEntry) {
-					resultChan <- entry
-				}, func(entry BrowseEntry) {})
+				browseDone <- lookupType(ctx, fmt.Sprintf("%s.local.", cfg.Type), browser, func(entry BrowseEntry) {
+					select {
+					case resultChan <- entry:
+					case <-ctx.Done():
+					}
+				}, func(BrowseEntry) {}, false, testIface.Name)
 			}()
 
 			select {
 			case <-ctx.Done():
 				t.Fatal("timeout")
 			case entry := <-resultChan:
+				if !slicesEqual(entry.IPs, []net.IP{net.ParseIP("192.0.2.10")}) {
+					t.Fatalf("addresses=%v", entry.IPs)
+				}
 				if entry.Name != cfg.Name {
 					t.Fatalf("is=%v want=%v", entry.Name, cfg.Name)
 				}

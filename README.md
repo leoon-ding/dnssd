@@ -138,3 +138,62 @@ Twitter: [https://twitter.com/brutella](https://twitter.com/brutella)
 # License
 
 *dnssd* is available under the MIT license. See the LICENSE file for more info.
+
+
+### Continuous browsing and optional legacy discovery
+
+All existing browse and instance-resolution APIs use ordinary mDNS by default,
+including Windows. Continuous browsing retains exponential discovery backoff
+(up to one hour) and independently renews actively referenced normal records at
+80-82%, 85-87%, 90-92%, and 95-97% of their actual received TTL. Successful
+responses restart renewal. Same-question work is coalesced per interface;
+nearby sends are rate-limited, and valid shared PTR known answers suppress
+unnecessary responses.
+
+Explicitly enable supplemental legacy discovery when shared port 5353 or
+multicast reply delivery is unreliable:
+
+```go
+err := dnssd.LookupTypeWithOptions(ctx, "_scm._tcp.local.", onAdd, onRemove,
+    dnssd.BrowseOptions{
+        Continuous: true,
+        LegacyUnicast: true,
+        LegacyInterval: 5 * time.Minute, // zero also selects five minutes
+        // Interfaces: []string{"eth0"},
+    })
+```
+
+Legacy discovery runs at startup and then on its own interval with +/-10%
+jitter, rather than alongside every normal query. Intervals below ten seconds
+are rejected. Non-continuous browsing sends only the startup queries.
+Normal mDNS listening and advertising remain enabled. Legacy and normal
+queries cannot suppress each other because their response delivery differs.
+
+Legacy replies are transaction/question/source validated, expire within ten
+seconds, and NEVER schedule cache renewal. Normal and legacy RRsets retain
+separate lifetimes; a valid normal RRset takes precedence. A legacy-only
+result may disappear from the browse cache and reappear at the next discovery.
+Cache removal is not proof of connection failure: applications such as libscm
+must retain their own peer/heartbeat state.
+
+Requests still travel to the multicast group: this is not a solution when
+outbound multicast cannot reach peers. Interface changes restart discovery;
+cancellation releases sockets and workers. Cache expiration uses deadlines
+rather than frequent full-cache polling.
+
+Run deterministic tests with go test -race ./... . Set
+DNSSD_TEST_MULTICAST=1 on a controlled LAN to include real-socket integration
+tests. TestLANPeer exercises the same browser and responder for cross-device
+validation, including deliberately dropping received multicast.
+
+### Continuous integration
+
+GitHub Actions runs dependency verification, build, vet, and race-enabled tests
+on every pull request and push to master. The matrix covers Linux, Windows, and
+macOS with stable Go, plus Linux with the minimum supported Go 1.20. Module
+files must remain unchanged. The aggregate check is named `CI` and can be
+selected as a required status check in branch protection.
+
+Real multicast integration tests remain opt-in with `DNSSD_TEST_MULTICAST=1`
+on a controlled LAN; hosted CI runs deterministic tests and loopback socket
+tests without requiring multicast connectivity.

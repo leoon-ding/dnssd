@@ -2,6 +2,7 @@ package dnssd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -68,9 +69,10 @@ type Response struct {
 
 // Request represents an incoming mDNS message
 type Request struct {
-	msg   *dns.Msg       // The message
-	from  *net.UDPAddr   // The source addr of the message
-	iface *net.Interface // The network interface from which the message was received
+	legacy bool           // received on an explicitly owned legacy reply port
+	msg    *dns.Msg       // The message
+	from   *net.UDPAddr   // The source addr of the message
+	iface  *net.Interface // The network interface from which the message was received
 }
 
 func (r Request) String() string {
@@ -169,15 +171,17 @@ func (c *mdnsConn) Drain(ctx context.Context) {
 
 // JoinGroup joins the multicast group for the specified interface.
 func (c *mdnsConn) JoinGroup(iface *net.Interface) error {
+	if c.ipv4 == nil && c.ipv6 == nil {
+		return fmt.Errorf("no suitable connection for %s", iface.Name)
+	}
+	var errs []error
 	if c.ipv4 != nil {
-		return c.ipv4.JoinGroup(iface, &net.UDPAddr{IP: IPv4LinkLocalMulticast})
+		errs = append(errs, c.ipv4.JoinGroup(iface, &net.UDPAddr{IP: IPv4LinkLocalMulticast}))
 	}
-
 	if c.ipv6 != nil {
-		return c.ipv6.JoinGroup(iface, &net.UDPAddr{IP: IPv6LinkLocalMulticast})
+		errs = append(errs, c.ipv6.JoinGroup(iface, &net.UDPAddr{IP: IPv6LinkLocalMulticast}))
 	}
-
-	return fmt.Errorf("no suitable connection for %s", iface.Name)
+	return errors.Join(errs...)
 }
 
 // Close closes the mDNS connection.
@@ -302,6 +306,9 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				n, cm, from, err := c.ipv4.ReadFrom(buf)
 				if err != nil {
+					if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+						return
+					}
 					continue
 				}
 
@@ -328,8 +335,12 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				if n > 0 {
 					m := new(dns.Msg)
-					if err := m.Unpack(buf); err == nil && !shouldIgnore(m) {
-						ch <- &Request{m, udpAddr, iface}
+					if err := m.Unpack(buf[:n]); err == nil && !shouldIgnore(m) {
+						select {
+						case ch <- &Request{msg: m, from: udpAddr, iface: iface}:
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 			}
@@ -346,6 +357,9 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				n, cm, from, err := c.ipv6.ReadFrom(buf)
 				if err != nil {
+					if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+						return
+					}
 					continue
 				}
 
@@ -373,8 +387,12 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 
 				if n > 0 {
 					m := new(dns.Msg)
-					if err := m.Unpack(buf); err == nil && !shouldIgnore(m) {
-						ch <- &Request{m, udpAddr, iface}
+					if err := m.Unpack(buf[:n]); err == nil && !shouldIgnore(m) {
+						select {
+						case ch <- &Request{msg: m, from: udpAddr, iface: iface}:
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 			}
@@ -395,8 +413,11 @@ func (c *mdnsConn) sendResponse(m *dns.Msg, iface *net.Interface) error {
 }
 
 func (c *mdnsConn) sendResponseTo(m *dns.Msg, iface *net.Interface, addr *net.UDPAddr) error {
-	// Don't sanitize legacy unicast responses.
-	if !isLegacyUnicastSource(addr) {
+	// Keep the legacy ID and questions while normalizing record TTLs/classes.
+	if isLegacyUnicastSource(addr) {
+		m = m.Copy()
+		normalizeLegacyRecords(m)
+	} else {
 		sanitizeResponse(m)
 	}
 
