@@ -174,3 +174,15 @@ established application connection has failed.
 Run unit tests with `go test -race ./...`. On a host permitting LAN multicast,
 set `DNSSD_TEST_MULTICAST=1` to also run real-socket tests, including discovery
 with the multicast receive path deliberately silent and dual-path deduplication.
+
+### Continuous integration
+
+GitHub Actions runs dependency verification, build, vet, and race-enabled tests
+on every pull request and push to master. The matrix covers Linux, Windows, and
+macOS with stable Go, plus Linux with the minimum supported Go 1.20. Module
+files must remain unchanged. The aggregate check is named `CI` and can be
+selected as a required status check in branch protection.
+
+Real multicast integration tests remain opt-in with `DNSSD_TEST_MULTICAST=1`
+on a controlled LAN; hosted CI runs deterministic tests and loopback socket
+tests without requiring multicast connectivity.
