@@ -3,7 +3,6 @@ package dnssd
 import (
 	"context"
 	"io"
-	"runtime"
 	"strings"
 	"time"
 
@@ -15,7 +14,7 @@ import (
 func LookupInstance(ctx context.Context, instance string) (Service, error) {
 	var srv Service
 
-	conn, err := newLookupConn(ctx, runtime.GOOS == "windows")
+	conn, err := newLookupConn(ctx, false)
 	if err != nil {
 		return srv, err
 	}

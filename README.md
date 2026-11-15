@@ -140,40 +140,51 @@ Twitter: [https://twitter.com/brutella](https://twitter.com/brutella)
 *dnssd* is available under the MIT license. See the LICENSE file for more info.
 
 
-### Windows LAN discovery and legacy unicast
+### Continuous browsing and optional legacy discovery
 
-On Windows, the existing browse APIs and `LookupInstance` also query from
-independent ephemeral UDP ports. This avoids depending on which process owns
-unicast replies to shared port 5353. Multicast listening and announcements are
-retained. Other platforms keep multicast-only browsing by default.
+All existing browse and instance-resolution APIs use ordinary mDNS by default,
+including Windows. Continuous browsing retains exponential discovery backoff
+(up to one hour) and independently renews actively referenced normal records at
+80-82%, 85-87%, 90-92%, and 95-97% of their actual received TTL. Successful
+responses restart renewal. Same-question work is coalesced per interface;
+nearby sends are rate-limited, and valid shared PTR known answers suppress
+unnecessary responses.
 
-Use explicit options to enable or disable the extra query path per browser:
+Explicitly enable supplemental legacy discovery when shared port 5353 or
+multicast reply delivery is unreliable:
 
 ```go
 err := dnssd.LookupTypeWithOptions(ctx, "_scm._tcp.local.", onAdd, onRemove,
     dnssd.BrowseOptions{
         Continuous: true,
         LegacyUnicast: true,
+        LegacyInterval: 5 * time.Minute, // zero also selects five minutes
         // Interfaces: []string{"eth0"},
     })
 ```
 
-The zero value of `BrowseOptions` does not enable legacy queries, even on
-Windows. Sockets bind to a local address on each selected interface and share
-the normal browse cache. Legacy replies must match a pending transaction and
-question, come from port 5353 on the local link, and are cached for at most
-10 seconds. Continuous browsing refreshes these short-lived records. Interface
-changes reset continuous-query backoff; stale bound sockets close on the next
-query. Cancelling the browse closes its sockets and stops its forwarding workers.
+Legacy discovery runs at startup and then on its own interval with +/-10%
+jitter, rather than alongside every normal query. Intervals below ten seconds
+are rejected. Non-continuous browsing sends only the startup queries.
+Normal mDNS listening and advertising remain enabled. Legacy and normal
+queries cannot suppress each other because their response delivery differs.
 
-This is still multicast-assisted discovery: outbound multicast queries must
-reach the peer. It does not replace global discovery when multicast is blocked
-in both directions. Cache removal is a discovery event, not proof that an
-established application connection has failed.
+Legacy replies are transaction/question/source validated, expire within ten
+seconds, and NEVER schedule cache renewal. Normal and legacy RRsets retain
+separate lifetimes; a valid normal RRset takes precedence. A legacy-only
+result may disappear from the browse cache and reappear at the next discovery.
+Cache removal is not proof of connection failure: applications such as libscm
+must retain their own peer/heartbeat state.
 
-Run unit tests with `go test -race ./...`. On a host permitting LAN multicast,
-set `DNSSD_TEST_MULTICAST=1` to also run real-socket tests, including discovery
-with the multicast receive path deliberately silent and dual-path deduplication.
+Requests still travel to the multicast group: this is not a solution when
+outbound multicast cannot reach peers. Interface changes restart discovery;
+cancellation releases sockets and workers. Cache expiration uses deadlines
+rather than frequent full-cache polling.
+
+Run deterministic tests with go test -race ./... . Set
+DNSSD_TEST_MULTICAST=1 on a controlled LAN to include real-socket integration
+tests. TestLANPeer exercises the same browser and responder for cross-device
+validation, including deliberately dropping received multicast.
 
 ### Continuous integration
 

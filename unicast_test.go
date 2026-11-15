@@ -128,7 +128,7 @@ func TestLegacyBrowseWithoutMulticastReceive(t *testing.T) {
 	c := addLegacyQueries(ctx, &forkConn{requests: make(chan *Request)})
 	defer c.Close()
 	count := 0
-	err = lookupType(ctx, srv.ServiceName(), c, func(e BrowseEntry) {
+	err = browseWithOptions(ctx, srv.ServiceName(), c, func(e BrowseEntry) {
 		if e.Name == id {
 			count++
 			if e.Port != 12345 || len(e.IPs) == 0 {
@@ -136,7 +136,7 @@ func TestLegacyBrowseWithoutMulticastReceive(t *testing.T) {
 			}
 			cancel()
 		}
-	}, func(BrowseEntry) {}, true, iface.Name)
+	}, func(BrowseEntry) {}, BrowseOptions{Continuous: true, LegacyUnicast: true, Interfaces: []string{iface.Name}})
 	if err != context.Canceled || count != 1 {
 		t.Fatalf("legacy discovery failed: count=%d err=%v", count, err)
 	}

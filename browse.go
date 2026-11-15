@@ -2,13 +2,10 @@ package dnssd
 
 import (
 	"github.com/brutella/dnssd/log"
-	"github.com/miekg/dns"
 
 	"context"
 	"fmt"
-	"math/rand"
 	"net"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -34,7 +31,7 @@ type RmvFunc func(BrowseEntry)
 
 // LookupType browses for service instances.
 func LookupType(ctx context.Context, service string, add AddFunc, rmv RmvFunc) (err error) {
-	conn, err := newLookupConn(ctx, runtime.GOOS == "windows")
+	conn, err := newLookupConn(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -45,7 +42,7 @@ func LookupType(ctx context.Context, service string, add AddFunc, rmv RmvFunc) (
 
 // LookupTypeAtInterface browses for service instances at specific network interfaces.
 func LookupTypeAtInterfaces(ctx context.Context, service string, add AddFunc, rmv RmvFunc, ifaces ...string) (err error) {
-	conn, err := newLookupConn(ctx, runtime.GOOS == "windows", ifaces...)
+	conn, err := newLookupConn(ctx, false, ifaces...)
 	if err != nil {
 		return err
 	}
@@ -56,7 +53,7 @@ func LookupTypeAtInterfaces(ctx context.Context, service string, add AddFunc, rm
 
 // LookupTypeContinuously brwoses for service instances using Continuous Multicast DNS Querying
 func LookupTypeContinuously(ctx context.Context, service string, add AddFunc, rmv RmvFunc) (err error) {
-	conn, err := newLookupConn(ctx, runtime.GOOS == "windows")
+	conn, err := newLookupConn(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -121,33 +118,25 @@ func mapsEqual(a, b map[string]string) bool {
 }
 
 func lookupType(ctx context.Context, service string, conn MDNSConn, add AddFunc, rmv RmvFunc, continuous bool, ifaces ...string) (err error) {
-	var cache = NewCache()
 
-	m := new(dns.Msg)
-	m.Question = []dns.Question{
-		{
-			Name:   service,
-			Qtype:  dns.TypePTR,
-			Qclass: dns.ClassINET,
-		},
-	}
+	return browseWithOptions(ctx, service, conn, add, rmv, BrowseOptions{Continuous: continuous, Interfaces: ifaces})
+}
 
+func browseWithOptions(ctx context.Context, service string, conn MDNSConn, add AddFunc, rmv RmvFunc, options BrowseOptions) error {
+	cache := NewCache()
+	records := newBrowseRecords(service)
+	scheduler := newBrowseSchedule(time.Now(), options)
+	queryTimer := time.NewTimer(0)
+	defer queryTimer.Stop()
+	networkTicker := time.NewTicker(5 * time.Second)
+	defer networkTicker.Stop()
+	interfaces := MulticastInterfaces(options.Interfaces...)
+	scheduler.setInterfaces(interfaces)
+	networkState := browseNetworkState(options.Interfaces...)
+	lastNetworkCheck := time.Now()
 	readCtx, readCancel := context.WithCancel(ctx)
 	defer readCancel()
-
 	ch := conn.Read(readCtx)
-
-	// Schedule on the receive loop: cancellation cannot strand a query sender.
-	queryTimer := time.NewTimer(time.Duration(rand.Intn(100)+20) * time.Millisecond)
-	defer queryTimer.Stop()
-	interval := time.Second
-	nextQuery := time.Now().Add(120 * time.Millisecond)
-	expiryTicker := time.NewTicker(250 * time.Millisecond)
-	defer expiryTicker.Stop()
-	networkTicker := time.NewTicker(2 * time.Second)
-	defer networkTicker.Stop()
-	networkState := browseNetworkState(ifaces...)
-	lastNetworkCheck := time.Now()
 
 	es := []*BrowseEntry{}
 	syncEntries := func() {
@@ -217,59 +206,76 @@ func lookupType(ctx context.Context, service string, conn MDNSConn, add AddFunc,
 		}
 		es = tmp
 	}
+
 	for {
+		now := time.Now()
+		deadline := scheduler.next(records, now)
+		delay := time.Hour
+		if !deadline.IsZero() {
+			delay = deadline.Sub(now)
+			if delay < 0 {
+				delay = 0
+			}
+		}
+		if !queryTimer.Stop() {
+			select {
+			case <-queryTimer.C:
+			default:
+			}
+		}
+		queryTimer.Reset(delay)
 		select {
 		case <-queryTimer.C:
-			// Do not attach synthesized known answers: the service cache does not
-			// retain per-interface PTR TTLs and cannot safely suppress responses.
-			for _, iface := range MulticastInterfaces(ifaces...) {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if err := conn.SendQuery(&Query{msg: m.Copy(), iface: iface}); err != nil {
-					log.Debug.Println("SendQuery:", err)
+			now = time.Now()
+			if records.expire(now) {
+				cache = records.snapshot(now)
+				syncEntries()
+			}
+			for _, iface := range interfaces {
+				for _, batch := range scheduler.queries(records, iface, now) {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					q := &Query{msg: batch.msg, iface: iface}
+					var err error
+					if batch.legacy {
+						if sender, ok := conn.(interface{ SendLegacyQuery(*Query) error }); ok {
+							err = sender.SendLegacyQuery(q)
+						}
+					} else {
+						err = conn.SendQuery(q)
+					}
+					if err != nil {
+						log.Debug.Println("Browse query:", err)
+					}
 				}
 			}
-			if continuous {
-				delay := cache.refreshDelay(interval, service)
-				queryTimer.Reset(delay)
-				nextQuery = time.Now().Add(delay)
-				interval *= 2
-				if interval > time.Hour {
-					interval = time.Hour
-				}
-			}
+			scheduler.advance(now)
 		case now := <-networkTicker.C:
-			state := browseNetworkState(ifaces...)
-			// A delayed ticker may be the first activity after system resume.
-			resumed := now.UnixNano()-lastNetworkCheck.UnixNano() > int64(5*time.Second)
+			state := browseNetworkState(options.Interfaces...)
+			resumed := now.Sub(lastNetworkCheck) > 15*time.Second
 			lastNetworkCheck = now
 			if state != networkState || resumed {
 				networkState = state
-				if continuous {
-					interval = time.Second
-					queryTimer.Reset(time.Millisecond)
-					nextQuery = time.Now().Add(time.Millisecond)
+				nextInterfaces := MulticastInterfaces(options.Interfaces...)
+				joinBrowseInterfaces(conn, interfaces, nextInterfaces)
+				interfaces = nextInterfaces
+				scheduler.setInterfaces(interfaces)
+				records = newBrowseRecords(service)
+				cache = NewCache()
+				syncEntries()
+				if options.Continuous {
+					scheduler.restart(now)
 				}
 			}
-		case <-expiryTicker.C:
-			cache.removeExpired()
-			syncEntries()
-
 		case req, ok := <-ch:
 			if !ok {
-				return nil
+				return ctx.Err()
 			}
-			log.Debug.Printf("Receive message at %s\n%s\n", req.IfaceName(), req.msg)
-			cache.UpdateFrom(req)
-			if continuous {
-				delay := cache.refreshDelay(interval, service)
-				if deadline := time.Now().Add(delay); deadline.Before(nextQuery) {
-					queryTimer.Reset(delay)
-					nextQuery = deadline
-				}
+			if records.update(req, time.Now()) {
+				cache = records.snapshot(time.Now())
+				syncEntries()
 			}
-			syncEntries()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -291,24 +297,29 @@ func cloneBrowseEntry(e BrowseEntry) BrowseEntry {
 	return e
 }
 
-// BrowseOptions controls an explicitly configured browser. Existing browse
-// APIs enable legacy unicast queries by default on Windows only.
+// BrowseOptions controls browsing. Legacy discovery is opt-in on every platform.
 type BrowseOptions struct {
 	Interfaces []string
 	Continuous bool
-	// LegacyUnicast adds ephemeral-port queries alongside multicast browsing.
+	// LegacyUnicast enables independent ephemeral-port supplemental discovery.
 	// Requests still use multicast; this cannot discover unknown hosts when
 	// outbound multicast is blocked.
 	LegacyUnicast bool
+	// LegacyInterval defaults to five minutes. It must be at least ten seconds.
+	// With Continuous false, legacy discovery runs only at startup.
+	LegacyInterval time.Duration
 }
 
 func LookupTypeWithOptions(ctx context.Context, service string, add AddFunc, rmv RmvFunc, options BrowseOptions) error {
+	if options.LegacyInterval < 0 || (options.LegacyInterval > 0 && options.LegacyInterval < 10*time.Second) {
+		return fmt.Errorf("LegacyInterval must be zero or at least ten seconds")
+	}
 	conn, err := newLookupConn(ctx, options.LegacyUnicast, options.Interfaces...)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	return lookupType(ctx, service, conn, add, rmv, options.Continuous, options.Interfaces...)
+	return browseWithOptions(ctx, service, conn, add, rmv, options)
 }
 
 func browseNetworkState(filters ...string) string {
@@ -321,4 +332,29 @@ func browseNetworkState(filters ...string) string {
 	}
 	sort.Strings(state)
 	return strings.Join(state, ";")
+}
+
+// Join newly appearing links without repeatedly rejoining unchanged groups.
+func joinBrowseInterfaces(conn MDNSConn, previous, current []*net.Interface) {
+	if legacy, ok := conn.(*lookupConn); ok {
+		conn = legacy.MDNSConn
+	}
+	joiner, ok := conn.(interface{ JoinGroup(*net.Interface) error })
+	if !ok {
+		return
+	}
+	for _, iface := range current {
+		found := false
+		for _, old := range previous {
+			if old.Index == iface.Index && old.Name == iface.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if err := joiner.JoinGroup(iface); err != nil {
+				log.Debug.Println("Browse JoinGroup:", err)
+			}
+		}
+	}
 }

@@ -96,11 +96,10 @@ func (c *lookupConn) Close() {
 	c.workers.Wait()
 }
 
-func (c *lookupConn) SendQuery(q *Query) error {
-	// Send a private copy: the multicast writer sanitizes its input.
-	multicastErr := c.MDNSConn.SendQuery(&Query{msg: q.msg.Copy(), iface: q.iface})
+func (c *lookupConn) SendLegacyQuery(q *Query) error {
+	// Independent supplemental discovery; never append an ordinary query.
 	if q.iface == nil {
-		return multicastErr
+		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -122,9 +121,9 @@ func (c *lookupConn) SendQuery(q *Query) error {
 	}
 	addrs, err := q.iface.Addrs()
 	if err != nil {
-		return errors.Join(multicastErr, err)
+		return err
 	}
-	return errors.Join(multicastErr, c.sendLegacyQueries(q, addrs, openLegacyEndpoint))
+	return c.sendLegacyQueries(q, addrs, openLegacyEndpoint)
 }
 
 // sendLegacyQueries retains every address until an endpoint for its prefix has
@@ -265,7 +264,7 @@ func (c *lookupConn) receiveLegacy(e *legacyEndpoint) {
 		// Bound their cache lifetime and never apply their flush bits to multicast RRsets.
 		normalizeLegacyRecords(m)
 		select {
-		case c.out <- &Request{msg: m, from: from, iface: &e.iface}:
+		case c.out <- &Request{msg: m, from: from, iface: &e.iface, legacy: true}:
 		case <-c.ctx.Done():
 			return
 		}

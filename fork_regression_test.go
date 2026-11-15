@@ -221,34 +221,3 @@ func TestForkAddressGoodbyeAndRescue(t *testing.T) {
 		t.Fatal("goodbye did not expire")
 	}
 }
-
-func TestForkRefreshBoundsBackoff(t *testing.T) {
-	c, _, i, _ := forkCache()
-	if got := c.refreshDelay(time.Hour, "_scm._tcp.local."); got != time.Hour {
-		t.Fatal(got)
-	}
-	c.UpdateFrom(&Request{iface: i, msg: &dns.Msg{Answer: []dns.RR{forkAddress("192.168.1.10", 10, true)}}})
-	if got := c.refreshDelay(time.Hour, "_scm._tcp.local."); got != 5*time.Second {
-		t.Fatalf("short TTL not refreshed: %v", got)
-	}
-	if got := c.refreshDelay(time.Second, "_scm._tcp.local."); got != time.Second {
-		t.Fatalf("startup backoff extended: %v", got)
-	}
-}
-
-func TestForkRefreshIgnoresOtherServices(t *testing.T) {
-	c, _, iface, _ := forkCache()
-	unrelated := forkAddress("192.0.2.20", 1, true)
-	unrelated.Header().Name = "printer.local."
-	c.UpdateFrom(&Request{iface: iface, msg: &dns.Msg{Answer: []dns.RR{unrelated}}})
-	if delay := c.refreshDelay(time.Hour, "_scm._tcp.local."); delay != time.Hour {
-		t.Fatalf("unrelated address throttled browse: %v", delay)
-	}
-	printer := newService("Printer._ipp._tcp.local.")
-	printer.SetHostname("printer.local.")
-	printer.TTL = time.Second
-	c.services[printer.EscapedServiceInstanceName()] = printer
-	if delay := c.refreshDelay(time.Hour, "_scm._tcp.local."); delay != time.Hour {
-		t.Fatalf("unrelated service throttled browse: %v", delay)
-	}
-}

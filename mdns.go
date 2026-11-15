@@ -69,9 +69,10 @@ type Response struct {
 
 // Request represents an incoming mDNS message
 type Request struct {
-	msg   *dns.Msg       // The message
-	from  *net.UDPAddr   // The source addr of the message
-	iface *net.Interface // The network interface from which the message was received
+	legacy bool           // received on an explicitly owned legacy reply port
+	msg    *dns.Msg       // The message
+	from   *net.UDPAddr   // The source addr of the message
+	iface  *net.Interface // The network interface from which the message was received
 }
 
 func (r Request) String() string {
@@ -336,7 +337,7 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 					m := new(dns.Msg)
 					if err := m.Unpack(buf[:n]); err == nil && !shouldIgnore(m) {
 						select {
-						case ch <- &Request{m, udpAddr, iface}:
+						case ch <- &Request{msg: m, from: udpAddr, iface: iface}:
 						case <-ctx.Done():
 							return
 						}
@@ -388,7 +389,7 @@ func (c *mdnsConn) readInto(ctx context.Context, ch chan *Request) {
 					m := new(dns.Msg)
 					if err := m.Unpack(buf[:n]); err == nil && !shouldIgnore(m) {
 						select {
-						case ch <- &Request{m, udpAddr, iface}:
+						case ch <- &Request{msg: m, from: udpAddr, iface: iface}:
 						case <-ctx.Done():
 							return
 						}

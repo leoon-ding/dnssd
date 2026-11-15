@@ -90,31 +90,3 @@ func (c *Cache) expireAddresses() {
 		}
 	}
 }
-
-// Bound continuous-query backoff by live record lifetimes. This conservative
-// half-TTL refresh keeps short-lived addresses alive without known answers.
-func (c *Cache) refreshDelay(backoff time.Duration, service string) time.Duration {
-	delay := backoff
-	hosts := make(map[string]bool)
-	for _, srv := range c.services {
-		if !strings.EqualFold(srv.ServiceName(), service) {
-			continue
-		}
-		hosts[strings.ToLower(srv.Hostname())] = true
-		if d := srv.TTL / 2; d > 0 && d < delay {
-			delay = d
-		}
-	}
-	for key, rr := range c.addresses {
-		if !hosts[key.host] {
-			continue
-		}
-		if d := rr.expires.Sub(rr.received) / 2; d > 0 && d < delay {
-			delay = d
-		}
-	}
-	if delay < time.Second {
-		delay = time.Second
-	}
-	return delay
-}
