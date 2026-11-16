@@ -55,6 +55,20 @@ rp.Respond(ctx)
 When calling `Respond` the responder probes for the service instance name and host name to be unqiue in the network. 
 Once probing is finished, the service will be announced.
 
+Applications that need a startup completion signal can use
+`NewResponderWithReady(func() { close(ready) })`, where `ready` is a channel owned
+by the caller. The callback runs once, outside responder locks, after all services
+queued before `Respond` have been probed and the receive loop has been initialized.
+It indicates local readiness, not discovery by another host. After readiness,
+`Add` waits for its service's probe result before returning.
+
+Run `Respond(ctx)` in an owned goroutine and observe both the readiness signal and
+its returned error: failed startup does not signal readiness. On startup timeout,
+cancel `ctx` and wait for `Respond` to return before releasing dependencies.
+The callback must return promptly and must not wait for `Respond` to exit.
+A responder owns one connection lifetime; create a new responder to restart.
+The existing `NewResponder` and `Add`-before-`Respond` usage remains supported.
+
 #### Update TXT records
 
 Once a service is added to a responder, you can use the `hdl` to update properties.
