@@ -33,6 +33,11 @@ type Responder interface {
 
 type responder struct {
 	isRunning bool
+	started   bool
+	closed    bool
+	onReady   func()
+	probe     func(context.Context, Service) (Service, error)
+	workers   sync.WaitGroup
 	runCtx    context.Context
 
 	conn      MDNSConn
@@ -47,18 +52,30 @@ type responder struct {
 
 // NewResponder returns a new mDNS responder.
 func NewResponder() (Responder, error) {
+	return NewResponderWithReady(nil)
+}
+
+// NewResponderWithReady creates a single-run responder. onReady is called once,
+// after queued services have been probed and the receive loop is initialized.
+// It reports local readiness, not discovery by other hosts. The callback runs
+// without internal locks; it must return promptly and must not wait for Respond
+// to exit. Startup failure or cancellation before readiness skips the callback.
+func NewResponderWithReady(onReady func()) (Responder, error) {
 	conn, err := newMDNSConn()
 	if err != nil {
 		return nil, err
 	}
 
-	return newResponder(conn), nil
+	r := newResponder(conn)
+	r.onReady = onReady
+	return r, nil
 }
 
 func newResponder(conn MDNSConn) *responder {
 	r := &responder{
 		isRunning: false,
 		conn:      conn,
+		probe:     ProbeService,
 		unmanaged: []*serviceHandle{},
 		managed:   []*serviceHandle{},
 		mutex:     &sync.Mutex{},
@@ -86,6 +103,9 @@ func (r *responder) Remove(h ServiceHandle) {
 func (r *responder) Add(srv Service) (ServiceHandle, error) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+	if r.closed {
+		return nil, fmt.Errorf("responder is closed")
+	}
 
 	if r.isRunning {
 		parent := r.runCtx
@@ -109,33 +129,63 @@ func (r *responder) Add(srv Service) (ServiceHandle, error) {
 
 func (r *responder) Respond(ctx context.Context) error {
 	r.mutex.Lock()
+	if r.started {
+		r.mutex.Unlock()
+		return fmt.Errorf("responder has already been started")
+	}
+	r.started = true
+	runCtx, cancel := context.WithCancel(ctx)
+	r.isRunning = true
+	r.runCtx = runCtx
+	r.mutex.Unlock()
+	defer func() {
+		cancel()
+		r.mutex.Lock()
+		managed := services(r.managed)
+		r.isRunning = false
+		r.closed = true
+		r.runCtx = nil
+		r.managed = nil
+		r.unmanaged = nil
+		r.mutex.Unlock()
+		// Drain announcements and reprobes before closing their connection.
+		r.workers.Wait()
+		if !DisableResponderUnannounceWhileExit {
+			r.unannounce(managed)
+		}
+		r.conn.Close()
+	}()
+
 	err := func() error {
-		r.isRunning = true
-		r.runCtx = ctx
+		r.mutex.Lock()
+		// Release before the outer cleanup reacquires the lock, even on panic.
+		defer r.mutex.Unlock()
+		if err := runCtx.Err(); err != nil {
+			return err
+		}
 		for _, h := range r.unmanaged {
 			log.Debug.Println(h.service)
-			srv, err := r.register(ctx, *h.service)
+			srv, err := r.register(runCtx, *h.service)
 			if err != nil {
-				r.isRunning = false
-				r.runCtx = nil
 				return err
 			}
-
 			h.service = &srv
 			r.managed = append(r.managed, h)
 		}
-		r.unmanaged = []*serviceHandle{}
+		r.unmanaged = nil
 		return nil
 	}()
-	r.mutex.Unlock()
-
 	if err != nil {
 		return err
 	}
+	return r.respond(runCtx)
+}
 
-	//go r.linkSubscribe(ctx)
-
-	return r.respond(ctx)
+// launch is called under mutex or by an already tracked worker, so shutdown
+// cannot observe a zero count before all child work has been admitted.
+func (r *responder) launch(work func()) {
+	r.workers.Add(1)
+	go func() { defer r.workers.Done(); work() }()
 }
 
 // announce sends announcement messages including all services.
@@ -143,7 +193,7 @@ func (r *responder) announce(services []*Service) {
 	for _, service := range services {
 		for _, iface := range service.Interfaces() {
 			service, iface := service, iface
-			go r.announceAtInterface(service, iface)
+			r.launch(func() { r.announceAtInterface(service, iface) })
 		}
 	}
 }
@@ -199,7 +249,7 @@ func (r *responder) register(ctx context.Context, srv Service) (Service, error) 
 	}
 
 	log.Debug.Printf("Probing for host %s and service %s…\n", srv.Hostname(), srv.ServiceInstanceName())
-	probed, err := ProbeService(ctx, srv)
+	probed, err := r.probe(ctx, srv)
 	if err != nil {
 		return srv, err
 	}
@@ -208,7 +258,7 @@ func (r *responder) register(ctx context.Context, srv Service) (Service, error) 
 	for _, h := range r.managed {
 		srvs = append(srvs, h.service.Copy())
 	}
-	go r.announce(srvs)
+	r.launch(func() { r.announce(srvs) })
 
 	return probed, nil
 }
@@ -233,13 +283,25 @@ func (r *responder) respond(ctx context.Context) error {
 	readCtx, readCancel := context.WithCancel(ctx)
 	defer readCancel()
 	ch := r.conn.Read(readCtx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.onReady != nil {
+		r.onReady()
+	}
 
 	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case req := <-ch:
+		case req, ok := <-ch:
+			if !ok {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return fmt.Errorf("responder receive channel closed")
+			}
 			r.mutex.Lock()
 			r.handleRequest(req)
 			r.mutex.Unlock()
@@ -248,16 +310,6 @@ func (r *responder) respond(ctx context.Context) error {
 			r.handleLinkChange()
 
 		case <-ctx.Done():
-			r.mutex.Lock()
-			managed := services(r.managed)
-			r.isRunning = false
-			r.runCtx = nil
-			r.mutex.Unlock()
-
-			if !DisableResponderUnannounceWhileExit {
-				r.unannounce(managed)
-			}
-			r.conn.Close()
 			return ctx.Err()
 		}
 	}
@@ -273,7 +325,8 @@ func (r *responder) handleLinkChange() {
 		r.mutex.Lock()
 		pending := r.takeManaged()
 		for _, m := range pending {
-			go r.reprobe(m)
+			m := m
+			r.launch(func() { r.reprobe(m) })
 		}
 		r.mutex.Unlock()
 	} else if len(changed) > 0 {
@@ -284,7 +337,7 @@ func (r *responder) handleLinkChange() {
 				if len(m.service.Ifaces) == 0 || containsIfaces(iface.Name, m.service.Ifaces) {
 					service := m.service.Copy()
 					iface := iface
-					go r.announceAtInterface(service, &iface)
+					r.launch(func() { r.announceAtInterface(service, &iface) })
 				}
 			}
 			r.mutex.Unlock()
@@ -374,8 +427,9 @@ func (r *responder) handleRequest(req *Request) {
 		// Check if the request contains any conflicting records.
 		conflicts := findConflicts(req, r.managed)
 		for _, h := range conflicts {
+			h := h
 			log.Debug.Println("Reprobe for", h.service)
-			go r.reprobe(h)
+			r.launch(func() { r.reprobe(h) })
 
 			for i, m := range r.managed {
 				if h == m {
@@ -505,7 +559,7 @@ func (r *responder) reprobe(h *serviceHandle) {
 		announced = append(announced, handle.service.Copy())
 	}
 	r.mutex.Unlock()
-	go r.announce(announced)
+	r.launch(func() { r.announce(announced) })
 }
 
 func (r *responder) handleQuestion(q dns.Question, req *Request, srv Service) *dns.Msg {
